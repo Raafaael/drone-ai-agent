@@ -74,23 +74,30 @@ cooldown — se o item reapareceu, o drone pega na hora.
 
 ## Estrutura
 
+```
+drone-ai-agent/
+├── src/            # codigo do agente
+├── tests/          # testes offline (servidor simulado)
+└── Instrucoes/     # enunciado do trabalho
+```
+
 | Arquivo | Descrição |
 |---|---|
-| [main.py](main.py) | Ponto de entrada: conexão, loop principal e log em tela |
-| [devkit.py](devkit.py) | Cliente TCP/IP (porta 8888) e protocolo do GameServer |
-| [world_model.py](world_model.py) | Mapa, inferência/resolução lógica e A* |
-| [ai_agent.py](ai_agent.py) | Máquina de estados / tomada de decisão |
-| [fuzzy.py](fuzzy.py) | Controlador fuzzy de agressividade (combate) |
-| [test_offline.py](test_offline.py) | Testes offline com servidor simulado |
+| [src/main.py](src/main.py) | Ponto de entrada: conexão, loop principal e log em tela |
+| [src/devkit.py](src/devkit.py) | Cliente TCP/IP (porta 8888) e protocolo do GameServer |
+| [src/world_model.py](src/world_model.py) | Mapa, inferência/resolução lógica e A* |
+| [src/ai_agent.py](src/ai_agent.py) | Máquina de estados / tomada de decisão |
+| [src/fuzzy.py](src/fuzzy.py) | Controlador fuzzy de agressividade (combate) |
+| [tests/test_offline.py](tests/test_offline.py) | Testes offline com servidor simulado |
 
 ## Como executar
 
 ```bash
 # servidor de treino (padrão) com nome aleatório
-python main.py
+python src/main.py
 
 # host e nome específicos
-python main.py atari.icad.puc-rio.br MeuDrone
+python src/main.py atari.icad.puc-rio.br MeuDrone
 ```
 
 Não há dependências externas — apenas Python 3 (biblioteca padrão).
@@ -102,7 +109,7 @@ mudanças de estado (`[FSM]`), planejamento (`[PLANO]`) e descobertas do mapa
 ## Testes offline
 
 ```bash
-python test_offline.py
+python tests/test_offline.py
 ```
 
 Roda os testes do modelo de mundo (inferência + A*) e um teste de fumaça com

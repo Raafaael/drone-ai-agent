@@ -3,13 +3,17 @@ Testes offline do agente (sem servidor real):
 1. Testes do modelo de mundo (inferencia + A*).
 2. Simulador local minimal do GameServer para exercitar o loop completo.
 
-Uso: python test_offline.py
+Uso: python tests/test_offline.py
 """
 
+import os
 import socket
+import sys
 import threading
 import time
 import random
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from world_model import WorldModel, SAFE, VISITED, BLOCKED, DANGEROUS
 
