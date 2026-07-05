@@ -28,6 +28,13 @@ LOOP_BOX_AREA = 24
 MAX_ATTACK_DIST = 6         # tiro distante demais costuma virar custo puro
 DEFAULT_TREASURE_VALUE = 950
 DEFAULT_UNKNOWN_VALUE = 450
+PENDING_GRAB_TIMEOUT = 1.2  # espera max pelo delta de pontos de uma coleta
+
+THREAT_DECAY = 4.0          # segundos que uma deteccao de inimigo continua "recente"
+DANGER_MEMORY_WINDOW = 25.0  # memoria de zona quente para farm/fuga
+DANGER_RADIUS = 4           # raio (manhattan) de influencia de uma celula perigosa
+DANGER_PENALTY = 70         # penalidade maxima (celula igual ao perigo, agora mesmo)
+PROACTIVE_HUNT_COOLDOWN = 20.0  # min. intervalo entre scans proativos por passos
 
 TURN_LEFT_OF = {"north": "west", "west": "south", "south": "east", "east": "north"}
 TURN_RIGHT_OF = {"north": "east", "east": "south", "south": "west", "west": "north"}
@@ -64,7 +71,7 @@ class DroneAgent:
         # guarda anti-spam de 'pegar' por celula
         self.respawn_est = 3.5
         self.last_grab = {}
-        self.pending_grab = None
+        self.pending_grabs = []      # lista de coletas aguardando confirmacao de score
         self.item_values = {}        # (x,y) -> ganho liquido observado
         self.spot_respawn = {}       # (x,y) -> estimativa local
         self.spot_next_check = {}    # (x,y) -> nao voltar antes disso
@@ -74,6 +81,14 @@ class DroneAgent:
         self.recent_positions = []
         self.last_target = None
         self.teleport_landings = {}
+        # deteccao/memoria de ameaca: sensores de inimigo sao ruidosos
+        # (nao chegam a todo tick), entao a cautela persiste por um tempo
+        # em vez de evaporar assim que o sensor para de repetir
+        self.threat_until = 0.0
+        self.danger_cells = {}       # (x,y) -> timestamp da ultima ameaca ali
+        self.last_danger_cell = None
+        self.hunt_reason = None      # "damage" (reativo) ou "steps" (proativo)
+        self.last_proactive_hunt = 0.0
 
     # ---------------- percepcao ----------------
 
@@ -134,6 +149,26 @@ class DroneAgent:
         took_damage = "damage" in obs
         hears_steps = "steps" in obs
 
+        # memoria de ameaca: sensores de inimigo sao ruidosos (nao repetem a
+        # todo tick), entao guardamos ate quando a cautela deve persistir.
+        # had_prior_threat captura o estado ANTES desta deteccao, para
+        # diferenciar "primeiro sinal" de "ameaca persistente" (usado pelo
+        # scan proativo abaixo). threat_until reage a QUALQUER sinal (barato,
+        # so afeta o gatilho do scan), mas danger_cells (usada por
+        # _target_score/_flee_score para penalizar farm/fuga) so registra
+        # evidencia FORTE (dano real ou inimigo a queima-roupa): "steps"
+        # sozinho e ambiente demais (audio pode captar o adversario longe,
+        # em qualquer direcao) e marcar a propria celula onde o agente fica
+        # parado horas a fio (o ponto de farm) envenenaria justamente o
+        # melhor alvo conhecido por ruido de fundo, nao por perigo real.
+        now = time.time()
+        had_prior_threat = now < self.threat_until
+        if enemy_dist is not None or took_damage or hears_steps:
+            self.threat_until = now + THREAT_DECAY
+        if took_damage or (enemy_dist is not None and enemy_dist <= 3):
+            self.danger_cells[(x, y)] = now
+            self.last_danger_cell = (x, y)
+
         # a LUZ observada e a verdade do servidor: se ha luz, ha item AGORA
         # (essencial para farming de respawns). Guarda anti-spam evita pegar
         # duas vezes antes de o servidor processar.
@@ -175,9 +210,20 @@ class DroneAgent:
                 return "EXPLORE"
         if took_damage:
             # levamos tiro: o atirador esta em linha reta conosco
-            return "HUNT" if self.aggr >= 0.5 else "FLEE"
+            if self.aggr >= 0.5:
+                self.hunt_reason = "damage"
+                return "HUNT"
+            return "FLEE"
         if hears_steps and self.aggr < 0.25:
             return "FLEE"
+        # passos ouvidos de novo enquanto ja estavamos em janela de ameaca
+        # (persistente, nao um blip isolado) e energia favorece confronto:
+        # gira em busca do inimigo em vez de so continuar explorando as cegas.
+        if (hears_steps and had_prior_threat and self.aggr >= 0.65
+                and now - self.last_proactive_hunt >= PROACTIVE_HUNT_COOLDOWN):
+            self.last_proactive_hunt = now
+            self.hunt_reason = "steps"
+            return "HUNT"
         if energy <= LOW_ENERGY and self._due_spots(("powerup",), energy=0):
             return "RECHARGE"
         return "EXPLORE"
@@ -235,15 +281,11 @@ class DroneAgent:
         self.tick_count += 1
         prev_pos = self.last_pos
 
-        if self.pending_grab:
-            pos, prev_score, grabbed_at = self.pending_grab
-            if score != prev_score or time.time() - grabbed_at > 1.2:
-                delta = score - prev_score
-                if delta > 0:
-                    old = self.item_values.get(pos)
-                    self.item_values[pos] = delta if old is None else int(old * 0.7 + delta * 0.3)
-                    self.log(f"[FARM] Valor aprendido em {pos}: +{self.item_values[pos]}")
-                self.pending_grab = None
+        if self.tick_count % 50 == 0 and self.danger_cells:
+            cutoff = time.time() - DANGER_MEMORY_WINDOW
+            self.danger_cells = {p: t for p, t in self.danger_cells.items() if t >= cutoff}
+
+        self._resolve_pending_grabs(score)
 
         if self.awaiting_shot_result:
             if "hit" in obs:
@@ -320,8 +362,15 @@ class DroneAgent:
             self.log(f"[FSM] {self.state} -> {new_state} "
                      f"(pos=({x},{y}) energia={energy} pontos={score} "
                      f"aggr={getattr(self, 'aggr', 0.5):.2f} obs={obs})")
+            # HUNT so gira no lugar (nunca mexe em self.path), entao uma
+            # rota de farm/exploracao em andamento continua 100% valida
+            # depois do scan. Descartar o path aqui faria o agente abortar
+            # repetidamente uma rota quase completa a cada scan proativo
+            # (steps ambiente/frequente com outro drone no mapa), reduzindo
+            # a taxa de coleta sem nenhum ganho tatico.
+            if "HUNT" not in (self.state, new_state):
+                self.path = []
             self.state = new_state
-            self.path = []
 
         handler = {
             "EXPLORE": self.do_explore,
@@ -332,6 +381,30 @@ class DroneAgent:
             "FLEE": self.do_flee,
         }[self.state]
         handler(x, y, d, energy, obs)
+
+    def _resolve_pending_grabs(self, score):
+        """Resolve coletas pendentes contra o score atual, da mais antiga
+        para a mais nova. Cada coleta usa como referencia o prev_score da
+        PROXIMA coleta pendente (que, por ter sido lida depois, ja deveria
+        refletir o ganho desta), e so a mais recente usa o score atual —
+        assim farm rapido de pontos vizinhos nao perde amostra de
+        aprendizado de valor so porque a coleta anterior ainda nao confirmou."""
+        if not self.pending_grabs:
+            return
+        now = time.time()
+        ordered = sorted(self.pending_grabs, key=lambda p: p[2])
+        still_pending = []
+        for i, (pos, prev_score, grabbed_at) in enumerate(ordered):
+            reference = ordered[i + 1][1] if i + 1 < len(ordered) else score
+            if reference != prev_score or now - grabbed_at > PENDING_GRAB_TIMEOUT:
+                delta = reference - prev_score
+                if delta > 0:
+                    old = self.item_values.get(pos)
+                    self.item_values[pos] = delta if old is None else int(old * 0.7 + delta * 0.3)
+                    self.log(f"[FARM] Valor aprendido em {pos}: +{self.item_values[pos]}")
+            else:
+                still_pending.append((pos, prev_score, grabbed_at))
+        self.pending_grabs = still_pending
 
     def do_grab(self, x, y, d, energy, obs):
         kind = self.world.item_spots.get((x, y), "item")
@@ -345,7 +418,7 @@ class DroneAgent:
         self.last_grab[(x, y)] = now
         self.collect_count += 1
         self.collect_by_kind[kind] = self.collect_by_kind.get(kind, 0) + 1
-        self.pending_grab = ((x, y), prev_score, now)
+        self.pending_grabs.append(((x, y), prev_score, now))
         self.spot_next_check[(x, y)] = now + self.spot_respawn.get((x, y), self.respawn_est)
         self.spot_misses[(x, y)] = 0
         self.log(f"[COLETA] {kind} em ({x},{y}) | total_coletas={self.collect_count}")
@@ -370,9 +443,12 @@ class DroneAgent:
             self.log("[FSM] Muitos tiros sem acerto: desengajando por 8s")
 
     def do_hunt(self, x, y, d, energy, obs):
-        # gira procurando o inimigo; se der 4 voltas sem achar, volta a explorar
+        # gira procurando o inimigo. Scan reativo (levou tiro, atirador
+        # certamente em linha reta) gira ate 4x; scan proativo (so ouviu
+        # passos persistentes, inimigo pode nem estar perto) gira so 2x
+        # para nao desperdicar acoes atras de um alvo incerto.
         if self.hunt_turns <= 0:
-            self.hunt_turns = 4
+            self.hunt_turns = 2 if self.hunt_reason == "steps" else 4
         self.ai.send_turn_right()
         self.last_action = "turn"
         self.last_target = None
@@ -380,6 +456,7 @@ class DroneAgent:
         self.hunt_turns -= 1
         if self.hunt_turns == 0:
             self.state = "EXPLORE"
+            self.hunt_reason = None
 
     def do_flee(self, x, y, d, energy, obs):
         # afasta-se para uma celula visitada com saidas, pouco revisitada e
@@ -399,6 +476,28 @@ class DroneAgent:
                         break
         self._follow_path(x, y, d)
 
+    def _danger_penalty(self, cell):
+        """Penalidade por proximidade a uma celula onde recentemente houve
+        sinal de inimigo (dano/passos/mira). Decai com o tempo (memoria de
+        DANGER_MEMORY_WINDOW segundos) e com a distancia (raio DANGER_RADIUS).
+        Usa o PIOR sinal (max), nao a soma, para nao punir demais uma zona
+        com varias deteccoes antigas empilhadas."""
+        if not self.danger_cells:
+            return 0.0
+        now = time.time()
+        worst = 0.0
+        for pos, ts in self.danger_cells.items():
+            age = now - ts
+            if age > DANGER_MEMORY_WINDOW:
+                continue
+            dist = abs(pos[0] - cell[0]) + abs(pos[1] - cell[1])
+            if dist > DANGER_RADIUS:
+                continue
+            recency = 1.0 - age / DANGER_MEMORY_WINDOW
+            proximity = 1.0 - dist / (DANGER_RADIUS + 1)
+            worst = max(worst, DANGER_PENALTY * recency * proximity)
+        return worst
+
     def _flee_score(self, cell, x, y):
         dist = abs(cell[0] - x) + abs(cell[1] - y)
         exits = self.world.safe_exit_count(*cell)
@@ -407,7 +506,17 @@ class DroneAgent:
         for pos, kind in self.world.item_spots.items():
             if kind == "powerup":
                 power_bonus = max(power_bonus, 12 - abs(pos[0] - cell[0]) - abs(pos[1] - cell[1]))
-        return dist * 2 + exits * 8 + power_bonus - revisits * 3
+        # fugir nao e so "ficar longe de onde eu estava": premia alvos que
+        # aumentem a distancia em relacao a ULTIMA celula de ameaca (o
+        # caminho ate um alvo so "distante" pode passar perto do perigo).
+        danger_gain = 0.0
+        if self.last_danger_cell is not None:
+            dx, dy = self.last_danger_cell
+            dist_target = abs(cell[0] - dx) + abs(cell[1] - dy)
+            dist_now = abs(x - dx) + abs(y - dy)
+            danger_gain = (dist_target - dist_now) * 6
+        return (dist * 2 + exits * 8 + power_bonus - revisits * 3
+                + danger_gain - self._danger_penalty(cell) * 1.5)
 
     def do_recharge(self, x, y, d, energy, obs):
         if not self.path:
@@ -588,7 +697,7 @@ class DroneAgent:
                 value += 18
 
         return value - dist * 1.2 - revisits * 5 - recent_penalty \
-            - pit_penalty - tele_penalty
+            - pit_penalty - tele_penalty - self._danger_penalty(cell)
 
     def _unknown_neighbors(self, x, y):
         from world_model import UNKNOWN

@@ -53,11 +53,37 @@ cooldown — se o item reapareceu, o drone pega na hora.
   último recurso, quando não existe rota segura (teleporte não mata);
 - Powerup só é coletado com energia ≤ 70 (com energia cheia o item seria
   desperdiçado, e a tentativa custa -5);
-- `HUNT` (girar procurando o atirador) só é ativado ao **levar dano** — reagir
-  a `steps` girando desperdiça ações;
 - **Economia de munição**: tiro custa -10 e matar (+1000) exige 10 acertos;
   após 5 tiros sem `hit` o drone desengaja por 6s em vez de sangrar pontos
   contra um alvo que desvia;
+- **Memória de ameaça com dois níveis de confiança**: `steps` (áudio) é um
+  sensor ambiente — não indica direção nem garante proximidade real, e o
+  drone passa longos períodos parado sobre pontos de farm, então tratá-lo
+  como "perigo naquela célula" envenenaria justamente o melhor ponto
+  conhecido por ruído de fundo. Por isso `threat_until` (janela de cautela
+  que só decide **quando** vale a pena tentar um scan) reage a qualquer sinal
+  (`steps`/`damage`/`enemy#N`), mas `danger_cells` (usada para **penalizar**
+  farm/fuga) só registra evidência forte: dano realmente recebido ou inimigo
+  a queima-roupa (`enemy_dist` ≤ 3);
+- **Farm/exploração evitam zona de risco recente**: `_target_score` penaliza
+  células perto de uma detecção forte de inimigo (decai com tempo e
+  distância), reduzindo a chance de repetir farm num ponto onde o drone
+  levou tiro há pouco;
+- **Fuga direcionada**: `_flee_score` não maximiza só a distância da posição
+  atual — prioriza alvos que aumentem a distância em relação à última célula
+  de ameaça conhecida (fugir "para longe de onde eu estava" pode passar perto
+  de onde o tiro veio);
+- **`HUNT` reativo e proativo sem custo de rota**: além do `HUNT` reativo (ao
+  levar tiro), passos persistentes (não um blip isolado) com energia alta
+  também disparam uma busca curta pelo inimigo (cooldown de 20s, exige
+  agressividade alta). Como `HUNT` só gira no lugar, a transição
+  `EXPLORE → HUNT → EXPLORE` preserva o caminho de farm/exploração em
+  andamento em vez de descartá-lo — interromper e replanejar do zero a cada
+  scan reduziria a taxa de coleta sem ganho tático nenhum;
+- **Farm com múltiplas coletas pendentes**: coletas em sequência rápida em
+  pontos vizinhos (antes da primeira confirmar no score) são resolvidas
+  independentemente, sem perder a amostra de aprendizado de valor de nenhuma
+  delas;
 - **Dados frescos ou nada**: se status/observação não chegam dentro do
   timeout, o tick é descartado — agir com dados velhos atribuiria sensores à
   célula errada e poderia marcar como "seguro" o vizinho de um poço. O
@@ -112,6 +138,8 @@ mudanças de estado (`[FSM]`), planejamento (`[PLANO]`) e descobertas do mapa
 python tests/test_offline.py
 ```
 
-Roda os testes do modelo de mundo (inferência + A*) e um teste de fumaça com
-um GameServer simulado localmente, verificando que o agente explora, desvia de
-obstáculos e coleta um tesouro.
+Roda os testes do modelo de mundo (inferência + A*), lógica fuzzy, economia de
+tiro, memória de ameaça/perigo, fuga direcionada, farm com coletas pendentes
+concorrentes, e testes de fumaça com um `GameServer` simulado localmente
+(incluindo um inimigo simulado), verificando que o agente explora, desvia de
+obstáculos, foge/ataca de forma coerente e coleta/farma itens.

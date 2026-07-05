@@ -97,6 +97,7 @@ def test_fuzzy():
 class DummyAI:
     def __init__(self):
         self.actions = []
+        self.score = 0
 
     def send_shoot(self): self.actions.append("e")
     def send_turn_right(self): self.actions.append("d")
@@ -157,6 +158,24 @@ class MiniServer(threading.Thread):
         self.respawn = None      # segundos para itens reaparecerem
         self._respawn_at = {}
         self.actions = []
+        # simulacao de inimigo (combate/deteccao): controlado pelo teste via
+        # set_enemy/clear_enemy/set_steps/hit_player, refletido na proxima
+        # observacao ('o') como enemy#N / steps / damage
+        self.enemy_dist = None
+        self.emit_steps = False
+        self.pending_damage = False
+
+    def set_enemy(self, dist):
+        self.enemy_dist = dist
+
+    def clear_enemy(self):
+        self.enemy_dist = None
+
+    def set_steps(self, active):
+        self.emit_steps = active
+
+    def hit_player(self):
+        self.pending_damage = True
 
     def run(self):
         try:
@@ -219,6 +238,13 @@ class MiniServer(threading.Thread):
                            (self.x, self.y + 1), (self.x - 1, self.y)]
                     if any(p in self.pits for p in adj):
                         obs.append("breeze")
+                    if self.enemy_dist is not None:
+                        obs.append(f"enemy#{self.enemy_dist}")
+                    if self.emit_steps:
+                        obs.append("steps")
+                    if self.pending_damage:
+                        obs.append("damage")
+                        self.pending_damage = False
                     conn.sendall(f"o;{','.join(obs)}\n".encode())
                 elif c == "q":
                     if self.reply_delay:
@@ -361,6 +387,149 @@ def test_farming():
     print(f"OK: farming (coletas repetidas no mesmo ponto, score={server.score})")
 
 
+def test_threat_memory_smooths_flicker():
+    """Passos ouvidos uma vez devem manter a 'memoria de ameaca' (threat_until,
+    usada so para o gatilho do scan proativo) ativa por alguns instantes mesmo
+    se o sensor nao repetir no tick seguinte. Mas 'steps' sozinho (ambiente,
+    sem precisao de posicao) NAO deve marcar danger_cells: isso envenenaria o
+    proprio ponto de farm (onde o agente fica parado) so por ruido de fundo.
+    danger_cells so registra evidencia forte: dano real ou inimigo colado."""
+    from ai_agent import DroneAgent
+
+    agent = DroneAgent(DummyAI(), log=lambda m: None)
+    before = time.time()
+    agent.decide_state(5, 5, 60, ["steps"])
+    assert agent.threat_until > before
+    assert not agent.danger_cells, \
+        "'steps' isolado nao deveria marcar celula como perigosa (ambiente demais)"
+
+    # tick seguinte sem nenhum sensor de inimigo: a cautela (threat_until) nao evapora na hora
+    agent.decide_state(6, 5, 60, [])
+    assert agent.threat_until > time.time(), \
+        "memoria de ameaca nao deveria evaporar no tick seguinte sem sensor"
+
+    # evidencia forte (dano real) SIM marca a celula de perigo
+    agent.decide_state(6, 5, 60, ["damage"])
+    assert (6, 5) in agent.danger_cells
+    assert agent.last_danger_cell == (6, 5)
+    print("OK: threat memory (scan proativo suaviza flicker; farm so evita perigo real)")
+
+
+def test_danger_avoidance_in_scoring():
+    """Um alvo de farm/exploracao perto de uma deteccao recente de inimigo
+    deve pontuar pior do que o mesmo alvo sem essa memoria de perigo (evita
+    repetir farm em zona contestada por outro drone)."""
+    from ai_agent import DroneAgent
+
+    agent = DroneAgent(DummyAI(), log=lambda m: None)
+    agent.world.item_spots[(10, 10)] = "treasure"
+    agent.world.update_from_observation(10, 10, [])
+
+    score_without_danger = agent._target_score((10, 10), 0, 0, 100)
+    agent.danger_cells[(10, 11)] = time.time()  # perigo recente colado ao alvo
+    score_with_danger = agent._target_score((10, 10), 0, 0, 100)
+
+    assert score_with_danger < score_without_danger, \
+        (score_with_danger, score_without_danger)
+    print("OK: danger avoidance (farm evita zona de risco recente)")
+
+
+def test_directional_flee():
+    """Fugir deve preferir alvos que aumentem a distancia em relacao a
+    ULTIMA celula de ameaca conhecida, nao so a distancia da posicao atual
+    (o caminho ate um alvo 'distante' pode passar perto do perigo)."""
+    from ai_agent import DroneAgent
+
+    agent = DroneAgent(DummyAI(), log=lambda m: None)
+    agent.last_danger_cell = (5, 0)
+    agent.danger_cells[(5, 0)] = time.time()
+
+    # ambos os alvos ficam a mesma distancia da posicao atual (5,5), mas um
+    # se afasta da ameaca (5,0) e o outro se aproxima dela
+    away = agent._flee_score((5, 9), 5, 5)
+    toward = agent._flee_score((6, 2), 5, 5)
+    assert away > toward, (away, toward)
+    print("OK: directional flee (fuga prioriza se afastar da ameaca conhecida)")
+
+
+def test_proactive_hunt_on_persistent_steps():
+    """Passos ouvidos persistentemente (nao um blip isolado) com energia alta
+    devem, em algum momento, disparar HUNT proativo mesmo sem levar dano --
+    da ao drone iniciativa de tentar avistar o inimigo primeiro."""
+    from ai_agent import DroneAgent
+
+    agent = DroneAgent(DummyAI(), log=lambda m: None)
+    states = [agent.decide_state(5, 5, 95, ["steps"]) for _ in range(3)]
+    assert "HUNT" in states, states
+    assert agent.hunt_reason == "steps"
+    print("OK: proactive hunt (iniciativa de combate por passos persistentes)")
+
+
+def test_multiple_pending_grabs():
+    """Duas coletas em pontos diferentes antes da primeira confirmar (farm
+    rapido de vizinhos) nao devem se sobrescrever: cada uma deve aprender seu
+    proprio valor quando o score correspondente chegar."""
+    from ai_agent import DroneAgent
+
+    ai = DummyAI()
+    agent = DroneAgent(ai, log=lambda m: None)
+    agent.world.item_spots[(5, 5)] = "treasure"
+    agent.world.item_spots[(6, 5)] = "treasure"
+
+    ai.score = 0
+    agent.do_grab(5, 5, "north", 100, [])
+    ai.score = 500
+    agent.do_grab(6, 5, "north", 100, [])
+    assert len(agent.pending_grabs) == 2, "as duas coletas devem coexistir pendentes"
+
+    ai.score = 1500
+    agent._resolve_pending_grabs(ai.score)
+
+    assert agent.item_values.get((5, 5)) == 500, agent.item_values
+    assert agent.item_values.get((6, 5)) == 1000, agent.item_values
+    assert not agent.pending_grabs
+    print("OK: multiple pending grabs (coletas sequenciais nao se perdem)")
+
+
+def test_combat_integration_via_server():
+    """Teste de fumaca de combate ponta a ponta via MiniServer: inimigo
+    simulado a curta distancia com energia alta deve levar o agente a
+    atirar (ATTACK); apos o inimigo sumir de vista, o agente deve poder
+    voltar a explorar."""
+    from devkit import GameAI
+    from ai_agent import DroneAgent
+
+    random.seed(13)
+    port = random.randint(20000, 30000)
+    server = MiniServer(port)
+    server.start()
+    time.sleep(0.2)
+
+    ai = GameAI()
+    assert ai.connect("127.0.0.1", "TesteCombate", port)
+    ai.game_status = "Game"
+    agent = DroneAgent(ai, log=lambda m: None)
+
+    server.set_enemy(3)
+    shots_before = 0
+    for _ in range(30):
+        agent.act()
+        time.sleep(0.01)
+        if agent.state == "ATTACK":
+            break
+    assert server.actions.count("e") >= 1, "agente nao atirou com inimigo perto e energia alta"
+
+    server.clear_enemy()
+    for _ in range(60):
+        agent.act()
+        time.sleep(0.01)
+        if agent.state == "EXPLORE":
+            break
+    assert agent.state in ("EXPLORE", "HUNT"), agent.state
+    ai.client.disconnect()
+    print("OK: combate integrado via MiniServer (ataque e retomada de exploracao)")
+
+
 if __name__ == "__main__":
     test_world_model()
     test_fuzzy()
@@ -370,4 +539,10 @@ if __name__ == "__main__":
     test_pit_avoidance()
     test_stale_data_discarded()
     test_farming()
+    test_threat_memory_smooths_flicker()
+    test_danger_avoidance_in_scoring()
+    test_directional_flee()
+    test_proactive_hunt_on_persistent_steps()
+    test_multiple_pending_grabs()
+    test_combat_integration_via_server()
     print("Todos os testes passaram.")
