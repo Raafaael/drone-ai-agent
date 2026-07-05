@@ -100,6 +100,21 @@ python src/main.py
 python src/main.py atari.icad.puc-rio.br MeuDrone
 ```
 
+## DevKit e visualizador do professor
+
+Os downloads em `Instrucoes/devkit/` e `Instrucoes/visualizador/` sao
+ferramentas locais. O agente nao importa esses arquivos: `src/devkit.py`
+implementa diretamente o protocolo TCP/IP do PDF (porta 8888, comandos
+`w/s/a/d/t/e/o/g/q/p/u`, `name`, `color`, `quit`).
+
+Use o devkit do professor como referencia do protocolo ou para comparar com o
+bot aleatorio (`Instrucoes/devkit/run.bat`). Nao entregue esse bot aleatorio no
+lugar do agente em `src/`.
+
+O visualizador (`Instrucoes/visualizador/win_observant/drones.exe`) deve ser
+aberto em paralelo com a partida para observar o jogo. Ele nao substitui o
+servidor e nao precisa ser versionado junto com o codigo do agente.
+
 Não há dependências externas — apenas Python 3 (biblioteca padrão).
 
 O programa exibe em tela o log de todas as ações realizadas (`[ACAO]`),

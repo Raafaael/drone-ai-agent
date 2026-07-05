@@ -16,6 +16,8 @@ from devkit import GameAI
 from ai_agent import DroneAgent
 
 TICK = 0.07  # intervalo entre acoes (segundos)
+SCOREBOARD_INTERVAL = 5.0  # nao peça a cada tick para evitar spam no servidor/log
+BOT_COLOR = (140, 40, 220)  # roxo
 
 
 def log(msg):
@@ -32,11 +34,13 @@ def main():
         log("[INIT] Nao foi possivel conectar. Verifique o servidor.")
         sys.exit(1)
 
-    ai.send_color(0, 200, 255)
+    ai.send_color(*BOT_COLOR)
+    log(f"[INIT] Cor definida: RGB{BOT_COLOR}")
     agent = DroneAgent(ai, log=log)
     log("[INIT] Conectado. Aguardando inicio da partida...")
 
     last_game_check = 0.0
+    last_scoreboard_check = 0.0
     was_in_game = False
     try:
         while ai.connected:
@@ -56,6 +60,10 @@ def main():
             was_in_game = in_game
 
             if in_game:
+                if now - last_scoreboard_check > SCOREBOARD_INTERVAL:
+                    scoreboard = ai.request_scoreboard_sync(timeout=0.4)
+                    log(f"[PLACAR] pontos={ai.score} energia={ai.energy} | {scoreboard}")
+                    last_scoreboard_check = now
                 if ai.player_state == "dead":
                     log("[JOGO] Drone morto. Aguardando proxima rodada...")
                     time.sleep(2)
@@ -64,9 +72,9 @@ def main():
             else:
                 # Ready/Gameover: apenas espera (comandos de controle desabilitados)
                 if "over" in status:
-                    ai.send_request_scoreboard()
+                    scoreboard = ai.request_scoreboard_sync(timeout=0.4)
                     log(f"[JOGO] Estado: {ai.game_status} | pontos: {ai.score} | "
-                        f"placar: {ai.scoreboard}")
+                        f"placar: {scoreboard}")
                 time.sleep(1)
                 continue
 

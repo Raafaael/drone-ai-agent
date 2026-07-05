@@ -16,32 +16,12 @@ controlador fuzzy (fuzzy.py) sobre energia e distancia do inimigo.
 
 import time
 
-from world_model import (WorldModel, DIR_VECTORS, DANGEROUS, DANGER_PIT,
-                         DANGER_BOTH, DANGER_FLASH, SAFE, VISITED, BLOCKED,
-                         UNKNOWN,
+from _baseline.world_model import (WorldModel, DIR_VECTORS, DANGEROUS, DANGER_PIT,
+                         DANGER_BOTH, DANGER_FLASH, VISITED, BLOCKED,
                          in_bounds, neighbors)
-from fuzzy import combat_aggressiveness
+from _baseline.fuzzy import combat_aggressiveness
 
-LOW_ENERGY = 40         # abaixo disso, busca powerup conhecido
-ATTACK_MAX_DIST = 4     # so atira em alvo perto (alta prob. de acerto consecutivo)
-
-# Planejamento de farming por utilidade preditiva (valor por segundo).
-# O tempo e estimado em "acoes" convertidas para segundos; o ranking
-# equilibra naturalmente farmar (voltar a um ponto maduro) e explorar
-# (descobrir novos pontos em vez de ficar ocioso esperando respawn).
-SEC_PER_ACTION = 0.12
-RESPAWN_DEFAULT = 12.0
-ITEM_VALUE = {"treasure": 1000.0, "unknown": 700.0, "powerup": 300.0}
-# Valor de uma celula de fronteira (exploracao). DECAI conforme ja conhecemos
-# pontos de item: cedo (poucos pontos) explorar e prioritario para descobrir o
-# circuito; com varios pontos conhecidos, sob disputa, ACAMPAR/farmar vence a
-# corrida do respawn contra rivais -> exploracao perde prioridade.
-EXPLORE_BASE = 900.0
-EARLY_EXPLORE_SECONDS = 60.0
-EARLY_EXPLORE_MIN_SPOTS = 3
-EARLY_EXPLORE_BOOST = 0.60
-EARLY_FARM_DISCOUNT = 0.25
-FRONTIER_INFO_WEIGHT = 0.15
+LOW_ENERGY = 40  # abaixo disso, busca powerup conhecido
 
 TURN_LEFT_OF = {"north": "west", "west": "south", "south": "east", "east": "north"}
 TURN_RIGHT_OF = {"north": "east", "east": "south", "south": "west", "west": "north"}
@@ -69,13 +49,10 @@ class DroneAgent:
         self.engage_pause_until = 0.0
         # economia de acoes: instante em que ficamos sem alvos
         self.idle_since = None
-        # farming: estimativa adaptativa do tempo de respawn POR PONTO
-        # (moedas e pocoes reaparecem em ritmos diferentes; pontos disputados
-        # por rivais aprendem um respawn 'efetivo' maior e perdem prioridade)
-        # e guarda anti-spam de 'pegar' por celula
-        self.respawn_est = {}      # (x,y) -> segundos estimados
+        # farming: estimativa adaptativa do tempo de respawn dos itens e
+        # guarda anti-spam de 'pegar' por celula
+        self.respawn_est = 12.0
         self.last_grab = {}
-        self.start_time = time.time()
 
     # ---------------- percepcao ----------------
 
@@ -162,23 +139,17 @@ class DroneAgent:
         if has_item:
             return "GRAB"
         if enemy_dist is not None:
-            # Combate so compensa quando o EV e positivo: matar (+1000) exige
-            # 10 acertos (-10/tiro) num alvo que se move, entao so atiramos
-            # PERTO (alta prob. de acerto) e fortes. Inimigo longe -> ignora e
-            # segue farmando (nao queima tiros em alvo que desvia). So foge se
-            # fraco E sob ameaca proxima (fugir de longe so perde farming).
+            # desengajado por excesso de tiros errados? ignora e segue
             if time.time() < self.engage_pause_until and "hit" not in obs:
                 pass
-            elif self.aggr >= 0.5 and enemy_dist <= ATTACK_MAX_DIST:
+            elif self.aggr >= 0.35:
                 return "ATTACK"
-            elif self.aggr < 0.2 and enemy_dist <= ATTACK_MAX_DIST:
+            else:
                 return "FLEE"
         if took_damage:
             # levamos tiro: o atirador esta em linha reta conosco
             return "HUNT" if self.aggr >= 0.5 else "FLEE"
-        # 'steps' (rival a <=2 passos) e comum com varios inimigos; so
-        # interrompe o farming para fugir se estivermos fracos de verdade
-        if hears_steps and self.aggr < 0.25 and energy <= LOW_ENERGY:
+        if hears_steps and self.aggr < 0.25:
             return "FLEE"
         if energy <= LOW_ENERGY and self._due_spots(("powerup",), energy=0):
             return "RECHARGE"
@@ -196,42 +167,9 @@ class DroneAgent:
             if kind == "powerup" and energy > 70:
                 continue
             if pos not in self.last_taken or \
-                    now - self.last_taken[pos] >= self.respawn_est.get(pos, RESPAWN_DEFAULT):
+                    now - self.last_taken[pos] >= self.respawn_est:
                 out.append(pos)
         return out
-
-    def _farm_utility(self, pos, kind, dist_steps, now):
-        """Valor por segundo de buscar 'pos': valor do item / tempo ate poder
-        coleta-lo (viagem + espera ate amadurecer + 1 acao para pegar).
-        Pontos ainda nao maduros ganham penalidade de espera -> perdem para a
-        fronteira (explorar e melhor que ficar ocioso) e voltam a dominar
-        quando amadurecem. E o coracao da chegada preditiva."""
-        respawn = self.respawn_est.get(pos, RESPAWN_DEFAULT)
-        last = self.last_taken.get(pos)
-        ripe_in = 0.0 if last is None else max(0.0, respawn - (now - last))
-        arrive = dist_steps * SEC_PER_ACTION
-        wait = max(0.0, ripe_in - arrive)
-        total = arrive + wait + SEC_PER_ACTION
-        return ITEM_VALUE.get(kind, 500.0) / total
-
-    def _known_treasure_spots(self):
-        return sum(1 for k in self.world.item_spots.values()
-                   if k in ("treasure", "unknown"))
-
-    def _early_explore_pressure(self, now):
-        """Peso em [0,1] para descobrir mapa antes de farmar cedo demais."""
-        known = self._known_treasure_spots()
-        time_left = max(0.0, 1.0 - (now - self.start_time) / EARLY_EXPLORE_SECONDS)
-        item_gap = max(0.0, (EARLY_EXPLORE_MIN_SPOTS - known) / EARLY_EXPLORE_MIN_SPOTS)
-        return max(time_left, 0.8 * item_gap)
-
-    def _frontier_info_gain(self, pos):
-        """Estimativa simples de quanto uma fronteira abre do mapa."""
-        unknown_adj = sum(1 for n in neighbors(*pos)
-                          if self.world.grid[n[0]][n[1]] == UNKNOWN)
-        safe_adj = sum(1 for n in neighbors(*pos)
-                       if self.world.grid[n[0]][n[1]] == SAFE)
-        return 1 + unknown_adj + 0.5 * safe_adj
 
     # ---------------- comportamento por estado ----------------
 
@@ -285,13 +223,12 @@ class DroneAgent:
             age = time.time() - self.last_taken[(x, y)]
             light_now = any(o.lower() in ("bluelight", "redlight", "weaklight")
                             for o in obs)
-            cur = self.respawn_est.get((x, y), RESPAWN_DEFAULT)
-            if light_now and age < cur:
-                self.respawn_est[(x, y)] = max(2.0, age)
-                self.log(f"[FARM] {(x, y)} respawn mais rapido que o esperado: "
-                         f"estimativa -> {self.respawn_est[(x, y)]:.0f}s")
-            elif not light_now and cur < age < 120:
-                self.respawn_est[(x, y)] = min(60.0, age + 2)
+            if light_now and age < self.respawn_est:
+                self.respawn_est = max(8.0, age)
+                self.log(f"[FARM] Respawn mais rapido que o esperado: "
+                         f"estimativa -> {self.respawn_est:.0f}s")
+            elif not light_now and self.respawn_est < age < 120:
+                self.respawn_est = min(60.0, age + 2)
 
         new_state = self.decide_state(x, y, energy, obs)
         if new_state != self.state:
@@ -339,26 +276,14 @@ class DroneAgent:
             self.log("[FSM] 5 tiros sem acerto: desengajando por 6s (economia)")
 
     def do_hunt(self, x, y, d, energy, obs):
-        # Levamos tiro de um atirador em linha reta que NAO vemos. Girar no
-        # lugar denuncia a posicao e raramente acerta um alvo desconhecido;
-        # melhor SAIR DA LINHA DE TIRO (mudar de linha/coluna) e voltar a
-        # farmar. Se o inimigo aparecer na mira, o ATTACK assume no proximo tick.
-        if any(o.startswith(("enemy", "eneny")) for o in obs):
+        # gira procurando o inimigo; se der 4 voltas sem achar, volta a explorar
+        if self.hunt_turns <= 0:
+            self.hunt_turns = 4
+        self.ai.send_turn_right()
+        self.log("[ACAO] Procurando inimigo (girar a direita)")
+        self.hunt_turns -= 1
+        if self.hunt_turns == 0:
             self.state = "EXPLORE"
-            return
-        # passo lateral (perpendicular a direcao atual) para uma celula segura
-        vx, vy = DIR_VECTORS.get(d, (0, 0))
-        side = [n for n in neighbors(x, y)
-                if self.world.grid[n[0]][n[1]] in (VISITED, SAFE)
-                and (n[0] - x, n[1] - y) != (vx, vy)
-                and (n[0] - x, n[1] - y) != (-vx, -vy)]
-        target = side[0] if side else next(
-            (n for n in neighbors(x, y)
-             if self.world.grid[n[0]][n[1]] in (VISITED, SAFE)), None)
-        if target is not None:
-            self.step_towards(x, y, d, target)
-            self.log("[ACAO] Sob fogo: reposicionando para sair da linha de tiro")
-        self.state = "EXPLORE"
 
     def do_flee(self, x, y, d, energy, obs):
         # afasta-se: alvo = celula visitada mais distante alcancavel
@@ -394,70 +319,36 @@ class DroneAgent:
         self._follow_path(x, y, d)
 
     def _plan_exploration(self, x, y, d, energy):
-        """Escolhe o alvo de maior UTILIDADE (valor por segundo) entre farmar
-        e explorar, numa unica varredura BFS:
-
-        1. FARM: cada ponto de item conhecido e pontuado por
-           valor / (tempo de viagem + espera ate amadurecer). Pontos maduros
-           e proximos ganham; pontos recem-coletados perdem.
-        2. EXPLORAR: no inicio da partida, fronteiras que abrem mais vizinhos
-           desconhecidos recebem bonus. Assim o agente tenta descobrir um
-           circuito de coleta antes de voltar cedo demais para um unico ponto.
-        3. ACAMPAR: se o melhor alvo e a propria celula (item amadurecendo),
-           espera ali — esperar e gratis e a luz dispara o GRAB.
-        4. TELEPORTE / ESPERAR: ultimos recursos."""
+        """Prioridades (estrategia de farming — itens reaparecem):
+        1. FARM: ponto de item conhecido provavelmente disponivel;
+        2. EXPLORAR: fronteira do desconhecido (descobre novos pontos);
+        3. ACAMPAR: parar sobre o ponto de tesouro mais 'maduro' e esperar
+           o respawn (esperar e gratis; pegar custa 1 acao e rende +1000);
+        4. ESPERAR: nada alcancavel — economizar acoes."""
         now = time.time()
-        dist, parent = self.world.reachable_map((x, y))
+        due = [p for p in self._due_spots(("treasure", "unknown", "powerup"),
+                                          energy) if p != (x, y)]
         frontier = self.world.frontier_cells()
-        early_pressure = self._early_explore_pressure(now)
-
-        best_u, best_goal, best_label = 0.0, None, None
-        for pos, kind in self.world.item_spots.items():
-            if kind == "powerup" and energy > 70:
-                continue
-            dd = 0 if pos == (x, y) else dist.get(pos)
-            if dd is None:
-                continue
-            u = self._farm_utility(pos, kind, dd, now)
-            if pos in self.last_taken:
-                u *= 1.0 - EARLY_FARM_DISCOUNT * early_pressure
-            if u > best_u:
-                best_u, best_goal, best_label = u, pos, "FARM"
-        # Mantem o decaimento antigo por pontos conhecidos, mas com um bonus
-        # inicial moderado e preferencia por fronteiras mais informativas.
-        known = self._known_treasure_spots()
-        explore_decay = 1.0 + known
-        explore_value = EXPLORE_BASE * (1.0 + EARLY_EXPLORE_BOOST * early_pressure) / explore_decay
-        for f in frontier:
-            dd = dist.get(f)
-            if dd is None:
-                continue
-            info_gain = self._frontier_info_gain(f)
-            u = explore_value * (1.0 + FRONTIER_INFO_WEIGHT * info_gain) / \
-                (dd * SEC_PER_ACTION + 1.0)
-            if u > best_u:
-                best_u, best_goal, best_label = u, f, "PLANO"
 
         self.path_allows_flash = False
-        if best_goal is not None:
-            if best_goal == (x, y):
-                # melhor jogada e ficar onde estamos (ponto amadurecendo)
-                if self.idle_since is None:
-                    self.idle_since = now
-                    self.log(f"[FARM] Acampando em {best_goal} a espera do respawn")
+        for targets, label in ((due, "FARM"), (frontier, "PLANO")):
+            if not targets:
+                continue
+            # BFS multi-alvo: garante achar QUALQUER alvo alcancavel
+            goal, bfs_path = self.world.nearest_reachable((x, y), targets)
+            if goal:
+                # A* refina o caminho minimizando giros (mesma conectividade)
+                path = self.world.a_star((x, y), goal, allow_unknown=True,
+                                         start_dir=d) or bfs_path
+                self.goal = goal
+                self.path = path
+                self.idle_since = None
+                self.log(f"[{label}] Rumo a {goal} ({len(path)} passos)")
                 return
-            path = self.world.a_star((x, y), best_goal, allow_unknown=True,
-                                     start_dir=d) or self._path_from(parent, best_goal)
-            self.goal = best_goal
-            self.path = path
-            self.idle_since = None
-            self.log(f"[{best_label}] Rumo a {best_goal} "
-                     f"({len(path)} passos, u={best_u:.0f})")
-            return
 
         # sem rota segura para nada: atravessar suspeita APENAS de teleporte
         # (teleporte nao mata; poco continua proibido)
-        all_targets = list(self.world.item_spots) + frontier
+        all_targets = due + frontier
         if all_targets:
             goal, bfs_path = self.world.nearest_reachable((x, y), all_targets,
                                                           allow_flash=True)
@@ -469,6 +360,27 @@ class DroneAgent:
                 self.path_allows_flash = True
                 self.idle_since = None
                 self.log(f"[PLANO] Sem rota segura: arriscando teleporte rumo a {goal}")
+                return
+
+        # acampar: ir ao ponto de tesouro coletado ha mais tempo (o proximo
+        # a reaparecer) e esperar em cima dele
+        spots = [p for p, k in self.world.item_spots.items()
+                 if k in ("treasure", "unknown")]
+        if spots:
+            camp = min(spots, key=lambda p: self.last_taken.get(p, 0))
+            if camp == (x, y):
+                if self.idle_since is None:
+                    self.idle_since = now
+                    self.log(f"[FARM] Acampando em {camp} a espera do respawn")
+                return
+            goal, bfs_path = self.world.nearest_reachable((x, y), [camp])
+            if goal:
+                path = self.world.a_star((x, y), goal, allow_unknown=True,
+                                         start_dir=d) or bfs_path
+                self.goal = goal
+                self.path = path
+                self.idle_since = None
+                self.log(f"[FARM] Indo acampar em {goal}")
                 return
 
         # nada alcancavel: FICAR PARADO (acoes custam -1; esperar e gratis).
@@ -487,19 +399,8 @@ class DroneAgent:
                     self.log(f"[PLANO] Impasse: arriscando {best} "
                              f"(risco={self.world.pit_risk(*best)})")
 
-    def _path_from(self, parent, goal):
-        """Reconstroi o caminho (sem o start) a partir do mapa 'parent' do
-        reachable_map; fallback quando o A* nao retorna rota."""
-        path = []
-        node = goal
-        while node is not None and parent.get(node) is not None:
-            path.append(node)
-            node = parent[node]
-        path.reverse()
-        return path
-
     def _unknown_neighbors(self, x, y):
-        from world_model import UNKNOWN
+        from _baseline.world_model import UNKNOWN
         return [n for n in neighbors(x, y) if self.world.grid[n[0]][n[1]] == UNKNOWN]
 
     def _follow_path(self, x, y, d):

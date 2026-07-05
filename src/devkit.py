@@ -107,6 +107,7 @@ class GameAI:
         self.observations = []        # ultima lista de observacoes recebida
         self.obs_event = threading.Event()
         self.status_event = threading.Event()
+        self.scoreboard_event = threading.Event()
         self.lock = threading.Lock()
 
     # ---------------- conexao ----------------
@@ -192,6 +193,7 @@ class GameAI:
         elif head == "u":  # scoreboard
             with self.lock:
                 self.scoreboard = cmd[1:]
+            self.scoreboard_event.set()
 
         elif head == "notification":
             print(f"[SERVIDOR] {';'.join(cmd[1:])}")
@@ -227,6 +229,14 @@ class GameAI:
         with self.lock:
             return (self.player_x, self.player_y, self.player_dir,
                     self.player_state, self.score, self.energy)
+
+    def request_scoreboard_sync(self, timeout=0.5):
+        """Pede o placar e espera a resposta. Retorna a ultima lista recebida."""
+        self.scoreboard_event.clear()
+        self.send_request_scoreboard()
+        self.scoreboard_event.wait(timeout)
+        with self.lock:
+            return list(self.scoreboard)
 
     def request_sync_pair(self, timeout=0.5):
         """Pede status + observacoes em paralelo (1 ida-e-volta em vez de 2).

@@ -226,29 +226,6 @@ class WorldModel:
                 queue.append(nxt)
         return None, None
 
-    def reachable_map(self, start, allow_flash=False):
-        """BFS a partir de 'start': retorna (dist, parent) cobrindo TODAS as
-        celulas alcancaveis numa unica varredura. Usado pelo planejamento de
-        farming para rankear varios pontos de item por distancia sem rodar um
-        A* por alvo. Mesma politica de seguranca do nearest_reachable."""
-        dist = {start: 0}
-        parent = {start: None}
-        queue = deque([start])
-        while queue:
-            cur = queue.popleft()
-            for nxt in neighbors(*cur):
-                if nxt in dist:
-                    continue
-                cell = self.grid[nxt[0]][nxt[1]]
-                if cell == BLOCKED or cell in (DANGER_PIT, DANGER_BOTH):
-                    continue
-                if cell == DANGER_FLASH and not allow_flash:
-                    continue
-                dist[nxt] = dist[cur] + 1
-                parent[nxt] = cur
-                queue.append(nxt)
-        return dist, parent
-
     # ---------------- A* ----------------
 
     def a_star(self, start, goal, allow_unknown=False, start_dir=None,
