@@ -105,6 +105,7 @@ class GameAI:
 
         self.scoreboard = []
         self.observations = []        # ultima lista de observacoes recebida
+        self.pending_observations = []  # hit/damage recebidos fora do comando 'o'
         self.obs_event = threading.Event()
         self.status_event = threading.Event()
         self.lock = threading.Lock()
@@ -146,6 +147,19 @@ class GameAI:
 
     # ---------------- parsing das mensagens ----------------
 
+    def _remember_async_observation(self, obs_name):
+        """Guarda notificacoes avulsas (hit/damage) para o proximo tick.
+
+        Alguns servidores enviam acerto/dano fora da resposta do comando
+        'o'. Se isso for sobrescrito pela proxima observacao, o agente atira
+        e desvia como se nada tivesse acontecido.
+        """
+        with self.lock:
+            if obs_name not in self.pending_observations:
+                self.pending_observations.append(obs_name)
+            if obs_name not in self.observations:
+                self.observations.append(obs_name)
+
     def _handle_message(self, cmd):
         head = cmd[0].lower()
 
@@ -154,6 +168,12 @@ class GameAI:
             if len(cmd) > 1 and cmd[1] != "":
                 obs = [o.strip() for o in cmd[1].split(",") if o.strip()]
             with self.lock:
+                if self.pending_observations:
+                    seen = {o.lower() for o in obs}
+                    for pending in self.pending_observations:
+                        if pending.lower() not in seen:
+                            obs.append(pending)
+                    self.pending_observations.clear()
                 self.observations = obs
             self.obs_event.set()
 
@@ -194,6 +214,10 @@ class GameAI:
                 self.scoreboard = cmd[1:]
 
         elif head == "notification":
+            for part in cmd[1:]:
+                token = part.strip().lower()
+                if token in ("hit", "damage"):
+                    self._remember_async_observation(token)
             print(f"[SERVIDOR] {';'.join(cmd[1:])}")
 
         elif head == "hello":
@@ -206,8 +230,7 @@ class GameAI:
             pass
 
         elif head in ("h", "d"):  # hit / damage avulsos (alguns servidores)
-            with self.lock:
-                self.observations.append("hit" if head == "h" else "damage")
+            self._remember_async_observation("hit" if head == "h" else "damage")
 
     # ---------------- utilidades sincronas ----------------
 

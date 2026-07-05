@@ -68,6 +68,14 @@ def test_world_model():
     goal, path = w5.nearest_reachable((5, 5), [(9, 5), (30, 30)])
     assert goal == (9, 5) and path[-1] == (9, 5)
 
+    # fuga: escolhe o alvo mais distante dentre os realmente alcancaveis
+    w6 = WorldModel()
+    for x in (5, 6, 7, 9):
+        w6.mark_visited(x, 5)
+    w6.mark_blocked(8, 5)
+    goal, path = w6.farthest_reachable((5, 5), [(7, 5), (9, 5)])
+    assert goal == (7, 5) and path[-1] == (7, 5)
+
     # resolucao logica: brisa com um unico candidato -> poco CONFIRMADO
     w4 = WorldModel()
     w4.update_from_observation(10, 10, ["breeze"])
@@ -186,6 +194,112 @@ class MiniServer(threading.Thread):
                 elif c == "quit":
                     conn.close()
                     return
+
+
+class FakeAI:
+    """Dublê simples do GameAI para testar uma decisao por tick."""
+
+    def __init__(self, views):
+        self.views = list(views)
+        self.actions = []
+
+    def request_sync_pair(self, timeout=0.5):
+        if not self.views:
+            return None
+        return self.views.pop(0)
+
+    def send_forward(self): self.actions.append("w")
+    def send_backward(self): self.actions.append("s")
+    def send_turn_left(self): self.actions.append("a")
+    def send_turn_right(self): self.actions.append("d")
+    def send_get_item(self): self.actions.append("t")
+    def send_shoot(self): self.actions.append("e")
+
+
+def test_async_notifications_are_merged():
+    from devkit import GameAI
+
+    ai = GameAI()
+    ai._handle_message(["h"])
+    ai._handle_message(["d"])
+    ai._handle_message(["o", "enemy#3"])
+    assert "enemy#3" in ai.observations
+    assert "hit" in ai.observations
+    assert "damage" in ai.observations
+    assert ai.pending_observations == []
+
+    ai._handle_message(["o", ""])
+    assert "hit" not in ai.observations
+    assert "damage" not in ai.observations
+
+    ai._handle_message(["notification", "damage"])
+    ai._handle_message(["o", ""])
+    assert "damage" in ai.observations
+    print("OK: notificacoes avulsas hit/damage preservadas")
+
+
+def test_combat_attacks_close_enemy():
+    from ai_agent import DroneAgent
+
+    ai = FakeAI([(5, 5, "north", "game", 0, 90, ["enemy#3"])])
+    agent = DroneAgent(ai, log=lambda m: None)
+    agent.act()
+    assert ai.actions == ["e"], ai.actions
+    print("OK: combate atira em inimigo proximo na mira")
+
+
+def test_combat_skips_bad_long_shot_after_misses():
+    from ai_agent import DroneAgent
+
+    ai = FakeAI([(5, 5, "north", "game", 0, 100, ["enemy#9"])])
+    agent = DroneAgent(ai, log=lambda m: None)
+    agent.shots_since_hit = 2
+    agent.act()
+    assert "e" not in ai.actions, ai.actions
+    print("OK: combate evita tiro longo depois de misses")
+
+
+def test_damage_triggers_perpendicular_evade():
+    from ai_agent import DroneAgent
+
+    ai = FakeAI([(5, 5, "north", "game", 0, 60, ["damage"])])
+    agent = DroneAgent(ai, log=lambda m: None)
+    agent.act()
+    assert agent.state == "EVADE"
+    assert ai.actions == ["d"], ai.actions
+    assert agent.path == [(6, 5)]
+    print("OK: dano aciona esquiva perpendicular segura")
+
+
+def test_powerup_is_not_taken_with_high_energy():
+    from ai_agent import DroneAgent
+
+    ai = FakeAI([(5, 5, "north", "game", 0, 80, ["redLight"])])
+    agent = DroneAgent(ai, log=lambda m: None)
+    agent.act()
+    assert "t" not in ai.actions, ai.actions
+
+    ai = FakeAI([(5, 5, "north", "game", 0, 45, ["redLight"])])
+    agent = DroneAgent(ai, log=lambda m: None)
+    agent.act()
+    assert "t" in ai.actions, ai.actions
+    print("OK: powerup so e coletado quando energia justifica")
+
+
+def test_planner_prefers_higher_value_item_over_nearest():
+    from ai_agent import DroneAgent
+
+    ai = FakeAI([])
+    agent = DroneAgent(ai, log=lambda m: None)
+    # corredor seguro: powerup perto em (6,5), tesouro um passo mais longe em (7,5)
+    for x in range(5, 8):
+        agent.world.update_from_observation(x, 5, [])
+    agent.world.item_spots[(6, 5)] = "powerup"
+    agent.world.item_spots[(7, 5)] = "treasure"
+
+    agent._plan_exploration(5, 5, "east", energy=35)
+    assert agent.goal == (7, 5), agent.goal
+    print("OK: planejamento prioriza valor esperado do alvo")
 
 
 def test_smoke_agent():
@@ -320,6 +434,12 @@ def test_farming():
 if __name__ == "__main__":
     test_world_model()
     test_fuzzy()
+    test_async_notifications_are_merged()
+    test_combat_attacks_close_enemy()
+    test_combat_skips_bad_long_shot_after_misses()
+    test_damage_triggers_perpendicular_evade()
+    test_powerup_is_not_taken_with_high_energy()
+    test_planner_prefers_higher_value_item_over_nearest()
     test_smoke_agent()
     test_pit_avoidance()
     test_stale_data_discarded()

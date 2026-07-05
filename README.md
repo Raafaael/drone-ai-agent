@@ -8,7 +8,7 @@ drones.
 ## Técnicas de IA utilizadas (e onde aparecem na disciplina)
 
 - **Máquina de Estados Finitos** *(IA em Jogos / Máquinas de Estado)* —
-  estados `EXPLORE`, `GRAB`, `ATTACK`, `HUNT`, `RECHARGE` e `FLEE`
+  estados `EXPLORE`, `GRAB`, `ATTACK`, `EVADE`, `HUNT`, `RECHARGE` e `FLEE`
   ([ai_agent.py](ai_agent.py));
 - **Agentes Lógicos / inferência (Mundo de Wumpus)** *(Introdução aos
   Agentes Lógicos)* — dos sensores `breeze`/`flash` o agente deduz células
@@ -21,7 +21,8 @@ drones.
   células suspeitas de poço são **proibidas**;
 - **Lógica Fuzzy** *(Lógica Fuzzy)* — controlador Sugeno em
   [fuzzy.py](fuzzy.py): energia × distância do inimigo → *agressividade*
-  em [0,1], que decide entre `ATTACK`, `HUNT` e `FLEE` sem limiares rígidos;
+  em [0,1], que decide entre `ATTACK`, `EVADE`, `HUNT` e `FLEE` sem limiares
+  rígidos;
 - **Exploração por fronteira com patrulha** *(Waypoints / Tomada de Decisão
   tática)* — prioriza itens conhecidos, depois a fronteira do desconhecido
   e, com o mapa esgotado, patrulha os pontos de coleta mais antigos (itens
@@ -53,11 +54,12 @@ cooldown — se o item reapareceu, o drone pega na hora.
   último recurso, quando não existe rota segura (teleporte não mata);
 - Powerup só é coletado com energia ≤ 70 (com energia cheia o item seria
   desperdiçado, e a tentativa custa -5);
-- `HUNT` (girar procurando o atirador) só é ativado ao **levar dano** — reagir
-  a `steps` girando desperdiça ações;
+- `EVADE` move para uma célula segura perpendicular ao tiro após `damage`,
+  antes de caçar ou voltar ao farming; reagir a `steps` girando desperdiça
+  ações;
 - **Economia de munição**: tiro custa -10 e matar (+1000) exige 10 acertos;
-  após 5 tiros sem `hit` o drone desengaja por 6s em vez de sangrar pontos
-  contra um alvo que desvia;
+  o limite de tiros sem `hit` agora depende da distância (`enemy#dist`), então
+  alvo longe é abandonado mais cedo e alvo perto recebe mais pressão;
 - **Dados frescos ou nada**: se status/observação não chegam dentro do
   timeout, o tick é descartado — agir com dados velhos atribuiria sensores à
   célula errada e poderia marcar como "seguro" o vizinho de um poço. O
@@ -94,10 +96,10 @@ drone-ai-agent/
 
 ```bash
 # servidor de treino (padrão) com nome aleatório
-python src/main.py
+python3 main.py
 
 # host e nome específicos
-python src/main.py atari.icad.puc-rio.br MeuDrone
+python3 main.py atari.icad.puc-rio.br MeuDrone
 ```
 
 Não há dependências externas — apenas Python 3 (biblioteca padrão).
@@ -109,9 +111,8 @@ mudanças de estado (`[FSM]`), planejamento (`[PLANO]`) e descobertas do mapa
 ## Testes offline
 
 ```bash
-python tests/test_offline.py
+python3 tests/test_offline.py
 ```
 
-Roda os testes do modelo de mundo (inferência + A*) e um teste de fumaça com
-um GameServer simulado localmente, verificando que o agente explora, desvia de
-obstáculos e coleta um tesouro.
+Roda os testes do modelo de mundo (inferência + A*), combate, esquiva, farming
+e um teste de fumaça com um GameServer simulado localmente.

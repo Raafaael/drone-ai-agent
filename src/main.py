@@ -3,7 +3,7 @@ INF1771 - Trabalho Final: Desafio dos Drones
 Ponto de entrada do agente.
 
 Uso:
-    python main.py [host] [nome]
+    python main.py [host] [nome] [r] [g] [b]
 
 Padrao: host = atari.icad.puc-rio.br (servidor de treino), nome = DroneIA.
 """
@@ -25,6 +25,13 @@ def log(msg):
 def main():
     host = sys.argv[1] if len(sys.argv) > 1 else "atari.icad.puc-rio.br"
     name = sys.argv[2] if len(sys.argv) > 2 else f"DroneIA_{random.randint(100, 999)}"
+    color = (0, 200, 255)
+    if len(sys.argv) >= 6:
+        try:
+            color = tuple(max(0, min(255, int(v))) for v in sys.argv[3:6])
+        except ValueError:
+            log("[INIT] Cor invalida. Use valores RGB inteiros entre 0 e 255.")
+            sys.exit(1)
 
     ai = GameAI()
     log(f"[INIT] Conectando em {host}:8888 como '{name}'...")
@@ -32,7 +39,7 @@ def main():
         log("[INIT] Nao foi possivel conectar. Verifique o servidor.")
         sys.exit(1)
 
-    ai.send_color(0, 200, 255)
+    ai.send_color(*color)
     agent = DroneAgent(ai, log=log)
     log("[INIT] Conectado. Aguardando inicio da partida...")
 

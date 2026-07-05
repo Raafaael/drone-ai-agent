@@ -226,6 +226,50 @@ class WorldModel:
                 queue.append(nxt)
         return None, None
 
+    def farthest_reachable(self, start, goals, allow_flash=False):
+        """BFS multi-alvo: retorna o alvo alcancavel mais distante de start.
+
+        Usado para fuga: escolher a celula visitada mais distante por
+        Manhattan sem antes confirmar conectividade pode deixar o agente
+        parado tentando fugir para uma area inacessivel.
+        """
+        goals = set(goals) - {start}
+        if not goals:
+            return None, None
+        parent = {start: None}
+        queue = deque([start])
+        best = None
+        best_score = -1
+        while queue:
+            cur = queue.popleft()
+            if cur in goals:
+                score = abs(cur[0] - start[0]) + abs(cur[1] - start[1])
+                if score > best_score:
+                    best = cur
+                    best_score = score
+            for nxt in neighbors(*cur):
+                if nxt in parent:
+                    continue
+                cell = self.grid[nxt[0]][nxt[1]]
+                if cell == BLOCKED or cell in (DANGER_PIT, DANGER_BOTH):
+                    continue
+                if cell == DANGER_FLASH and not allow_flash:
+                    continue
+                if cell not in (SAFE, VISITED, DANGER_FLASH):
+                    continue
+                parent[nxt] = cur
+                queue.append(nxt)
+
+        if best is None:
+            return None, None
+        path = []
+        node = best
+        while node != start:
+            path.append(node)
+            node = parent[node]
+        path.reverse()
+        return best, path
+
     # ---------------- A* ----------------
 
     def a_star(self, start, goal, allow_unknown=False, start_dir=None,
