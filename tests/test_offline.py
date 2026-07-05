@@ -94,6 +94,50 @@ def test_fuzzy():
     print("OK: fuzzy (agressividade de combate)")
 
 
+class DummyAI:
+    def __init__(self):
+        self.actions = []
+
+    def send_shoot(self): self.actions.append("e")
+    def send_turn_right(self): self.actions.append("d")
+    def send_get_item(self): self.actions.append("t")
+    def send_forward(self): self.actions.append("w")
+    def send_turn_left(self): self.actions.append("a")
+
+
+def test_combat_fire_control():
+    """Tiro custa -10: inimigo longe ou baixa taxa de acerto nao deve
+    sequestrar a estrategia principal do agente."""
+    from ai_agent import DroneAgent
+
+    agent = DroneAgent(DummyAI(), log=lambda m: None)
+    assert agent.decide_state(0, 0, 50, ["enemy#8"]) == "EXPLORE"
+    assert agent.decide_state(0, 0, 90, ["enemy#4"]) == "ATTACK"
+
+    agent.shots_fired = 8
+    agent.shots_hit = 0
+    assert agent.decide_state(0, 0, 90, ["enemy#5"]) == "EXPLORE"
+    print("OK: combat fire control (economia de tiros)")
+
+
+def test_scored_planning_avoids_local_loop():
+    """Entre dois alvos alcancaveis, o planejador deve preferir sair da
+    regiao hiper-revisitada em vez de orbitar o vizinho mais proximo."""
+    from ai_agent import DroneAgent
+
+    agent = DroneAgent(DummyAI(), log=lambda m: None)
+    for x in range(5, 10):
+        agent.world.update_from_observation(x, 5, [])
+        agent.seen_cells.add((x, 5))
+
+    agent.recent_positions = [(6, 5), (5, 5)] * 13
+    agent.world.visit_count[(6, 5)] = 14
+    assert agent._plan_to_scored_targets(5, 5, "east", [(6, 5), (9, 5)],
+                                         "PLANO", 100)
+    assert agent.goal == (9, 5), agent.goal
+    print("OK: scored planning (anti-loop local)")
+
+
 class MiniServer(threading.Thread):
     """Simulador minimo do GameServer (1 cliente) para teste de fumaca."""
 
@@ -320,6 +364,8 @@ def test_farming():
 if __name__ == "__main__":
     test_world_model()
     test_fuzzy()
+    test_combat_fire_control()
+    test_scored_planning_avoids_local_loop()
     test_smoke_agent()
     test_pit_avoidance()
     test_stale_data_discarded()

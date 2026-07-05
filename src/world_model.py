@@ -61,6 +61,9 @@ class WorldModel:
         self.items = {}
         # memoria PERMANENTE de pontos de item (itens reaparecem -> farming)
         self.item_spots = {}
+        # memoria de revisitas: usada pelo planejador para evitar ficar
+        # circulando em salas pequenas quando ainda ha fronteira para abrir.
+        self.visit_count = {}
 
     # ---------------- atualizacao de conhecimento ----------------
 
@@ -70,6 +73,7 @@ class WorldModel:
         self.grid[x][y] = VISITED
         self.no_pit.add((x, y))
         self.no_flash.add((x, y))
+        self.visit_count[(x, y)] = self.visit_count.get((x, y), 0) + 1
 
     def mark_blocked(self, x, y):
         if in_bounds(x, y):
@@ -162,6 +166,22 @@ class WorldModel:
             return 99
         return sum(1 for (bx, by) in self.breeze_cells
                    if abs(bx - x) + abs(by - y) == 1)
+
+    def teleport_risk(self, x, y):
+        """Risco relativo de teleporte. Teleporte nao mata, mas quebra plano,
+        entao entra como penalidade economica e nao como proibicao absoluta."""
+        if (x, y) in self.no_flash:
+            return 0
+        if (x, y) in self.confirmed_teleports:
+            return 6
+        return sum(1 for (fx, fy) in self.flash_cells
+                   if abs(fx - x) + abs(fy - y) == 1)
+
+    def safe_exit_count(self, x, y):
+        """Numero de vizinhos que parecem utilizaveis sem assumir risco fatal.
+        Bom para escolher destinos de fuga e fronteiras que nao sejam becos."""
+        return sum(1 for nx, ny in neighbors(x, y)
+                   if self.grid[nx][ny] in (SAFE, VISITED, UNKNOWN, DANGER_FLASH))
 
     # ---------------- consultas ----------------
 
@@ -287,6 +307,7 @@ class WorldModel:
                     step = 15
                 else:
                     step = 3
+                step += min(self.visit_count.get(nxt, 0), 8) * 0.35
                 # custo de girar: 90 graus = 1 acao, 180 graus = 2 acoes
                 if cdir is not None and ndir != cdir:
                     opposite = (DIR_VECTORS[cdir][0] == -DIR_VECTORS[ndir][0] and

@@ -16,10 +16,38 @@ from devkit import GameAI
 from ai_agent import DroneAgent
 
 TICK = 0.07  # intervalo entre acoes (segundos)
+SUMMARY_INTERVAL = 30.0
+
+VISIBLE_PREFIXES = (
+    "[INIT]",
+    "[JOGO]",
+    "[FIM]",
+    "[COLETA]",
+    "[STATUS]",
+    "[FARM]",
+    "[REDE]",
+)
 
 
 def log(msg):
+    if not msg.startswith(VISIBLE_PREFIXES):
+        return
     print(f"{time.strftime('%H:%M:%S')} {msg}", flush=True)
+
+
+def log_summary(ai, agent):
+    collect_count = getattr(agent, "collect_count", 0)
+    by_kind = getattr(agent, "collect_by_kind", {})
+    kinds = ", ".join(f"{k}={v}" for k, v in sorted(by_kind.items())) or "nenhuma"
+    known_spots = len(getattr(agent.world, "item_spots", {}))
+    print(
+        f"{time.strftime('%H:%M:%S')} [STATUS] "
+        f"pontos={ai.score} energia={ai.energy} "
+        f"pos=({ai.player_x},{ai.player_y}) dir={ai.player_dir} "
+        f"estado={agent.state} coletas={collect_count} ({kinds}) "
+        f"pontos_item={known_spots}",
+        flush=True,
+    )
 
 
 def main():
@@ -37,6 +65,7 @@ def main():
     log("[INIT] Conectado. Aguardando inicio da partida...")
 
     last_game_check = 0.0
+    last_summary = 0.0
     was_in_game = False
     try:
         while ai.connected:
@@ -53,6 +82,7 @@ def main():
             if in_game and not was_in_game:
                 agent = DroneAgent(ai, log=log)
                 log("[JOGO] Partida iniciada: novo modelo de mundo")
+                last_summary = 0.0
             was_in_game = in_game
 
             if in_game:
@@ -61,6 +91,9 @@ def main():
                     time.sleep(2)
                 else:
                     agent.act()
+                    if now - last_summary >= SUMMARY_INTERVAL:
+                        log_summary(ai, agent)
+                        last_summary = now
             else:
                 # Ready/Gameover: apenas espera (comandos de controle desabilitados)
                 if "over" in status:
