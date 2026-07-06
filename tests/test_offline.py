@@ -238,6 +238,21 @@ def test_async_notifications_are_merged():
     print("OK: notificacoes avulsas hit/damage preservadas")
 
 
+def test_action_delay_is_adaptive():
+    import main as main_module
+
+    class Agent:
+        def __init__(self, state):
+            self.state = state
+
+    now = time.time()
+    assert main_module.action_delay(Agent("CHASE"), now - 100) == main_module.FAST_TICK
+    assert main_module.action_delay(Agent("ATTACK"), now - 100) == main_module.FAST_TICK
+    assert main_module.action_delay(Agent("EXPLORE"), now - 1) == main_module.OPENING_TICK
+    assert main_module.action_delay(Agent("EXPLORE"), now - 100) == main_module.TICK
+    print("OK: tick adaptativo acelera combate/inicio e desacelera farm")
+
+
 def test_combat_attacks_close_enemy():
     from ai_agent import DroneAgent
 
@@ -246,6 +261,17 @@ def test_combat_attacks_close_enemy():
     agent.act()
     assert ai.actions == ["e"], ai.actions
     print("OK: combate atira em inimigo proximo na mira")
+
+
+def test_combat_does_not_shoot_through_known_obstacle():
+    from ai_agent import DroneAgent
+
+    ai = FakeAI([(5, 5, "north", "game", 0, 90, ["enemy#3"])])
+    agent = DroneAgent(ai, log=lambda m: None)
+    agent.world.mark_blocked(5, 4)
+    agent.act()
+    assert "e" not in ai.actions, ai.actions
+    print("OK: combate nao atira atraves de obstaculo conhecido")
 
 
 def test_combat_skips_bad_long_shot_after_misses():
@@ -300,6 +326,176 @@ def test_planner_prefers_higher_value_item_over_nearest():
     agent._plan_exploration(5, 5, "east", energy=35)
     assert agent.goal == (7, 5), agent.goal
     print("OK: planejamento prioriza valor esperado do alvo")
+
+
+def test_quiet_period_camps_known_treasure_before_frontier():
+    from ai_agent import DroneAgent, QUIET_FARM_AFTER
+
+    ai = FakeAI([])
+    agent = DroneAgent(ai, log=lambda m: None)
+    now = time.time()
+    agent.last_threat_at = now - QUIET_FARM_AFTER - 1
+
+    # corredor seguro com tesouro conhecido ainda em cooldown; ha fronteiras
+    # abertas, mas em periodo quieto o agente deve voltar para farm/camping.
+    for x in range(5, 8):
+        agent.world.update_from_observation(x, 5, [])
+    agent.world.item_spots[(7, 5)] = "treasure"
+    agent.last_taken[(7, 5)] = now
+
+    agent._plan_exploration(5, 5, "east", energy=90)
+    assert agent.goal == (7, 5), agent.goal
+    assert agent.path[-1] == (7, 5), agent.path
+    print("OK: periodo quieto prioriza camping de tesouro conhecido")
+
+
+def test_kill_mode_attacks_long_enemy_and_ignores_treasure():
+    from ai_agent import DroneAgent
+
+    ai = FakeAI([(5, 15, "north", "game", 0, 20, ["enemy#10"])])
+    agent = DroneAgent(ai, log=lambda m: None)
+    agent.strategy = "kill"
+    agent.shots_since_hit = 5
+    agent.act()
+    assert ai.actions == ["e"], ai.actions
+
+    ai = FakeAI([(5, 5, "north", "game", 0, 100, ["blueLight"])])
+    agent = DroneAgent(ai, log=lambda m: None)
+    agent.strategy = "kill"
+    agent.act()
+    assert "t" not in ai.actions, ai.actions
+    print("OK: modo kill prioriza combate e ignora tesouro")
+
+
+def test_kill_mode_hunts_when_hearing_steps():
+    from ai_agent import DroneAgent
+
+    ai = FakeAI([(5, 5, "north", "game", 0, 100, ["steps"])])
+    agent = DroneAgent(ai, log=lambda m: None)
+    agent.strategy = "kill"
+    agent.act()
+    assert agent.state == "HUNT"
+    assert ai.actions == ["d"], ai.actions
+    print("OK: modo kill gira procurando inimigo ao ouvir passos")
+
+
+def test_killfarm_mode_fights_then_farms_when_quiet():
+    from ai_agent import DroneAgent, QUIET_FARM_AFTER
+
+    ai = FakeAI([(5, 5, "north", "game", 0, 90, ["enemy#4", "blueLight"])])
+    agent = DroneAgent(ai, log=lambda m: None)
+    agent.strategy = "killfarm"
+    agent.act()
+    assert ai.actions == ["e"], ai.actions
+
+    ai = FakeAI([(5, 5, "north", "game", 0, 90, ["steps"])])
+    agent = DroneAgent(ai, log=lambda m: None)
+    agent.strategy = "killfarm"
+    agent.act()
+    assert agent.state == "HUNT"
+    assert ai.actions == ["d"], ai.actions
+
+    ai = FakeAI([(5, 5, "north", "game", 0, 90, ["blueLight"])])
+    agent = DroneAgent(ai, log=lambda m: None)
+    agent.strategy = "killfarm"
+    agent.last_threat_at = time.time() - QUIET_FARM_AFTER - 1
+    agent.act()
+    assert ai.actions == ["t"], ai.actions
+    print("OK: modo killfarm luta com ameaca e farma no silencio")
+
+
+def test_killfarm_chases_long_enemy_when_score_is_positive():
+    from ai_agent import DroneAgent
+
+    ai = FakeAI([(5, 5, "north", "game", 500, 100, ["enemy#9"])])
+    agent = DroneAgent(ai, log=lambda m: None)
+    agent.strategy = "killfarm"
+    agent.act()
+    assert ai.actions == ["w"], ai.actions
+    assert agent.state == "CHASE", agent.state
+    print("OK: killfarm persegue inimigo longo em vez de desperdiçar tiro")
+
+
+def test_killfarm_grabs_treasure_on_ambiguous_steps():
+    from ai_agent import DroneAgent
+
+    ai = FakeAI([(5, 5, "north", "game", 0, 100, ["steps", "blueLight"])])
+    agent = DroneAgent(ai, log=lambda m: None)
+    agent.strategy = "killfarm"
+    agent.act()
+    assert ai.actions == ["t"], ai.actions
+    print("OK: killfarm coleta tesouro mesmo com steps ambiguo")
+
+
+def test_killfarm_defends_current_treasure_respawn():
+    from ai_agent import DroneAgent, QUIET_FARM_AFTER
+
+    ai = FakeAI([])
+    agent = DroneAgent(ai, log=lambda m: None)
+    now = time.time()
+    agent.strategy = "killfarm"
+    agent.last_threat_at = now - QUIET_FARM_AFTER - 1
+    agent.current_score = 1200
+    agent.respawn_est = 16.0
+
+    for x in range(5, 8):
+        agent.world.update_from_observation(x, 5, [])
+    agent.world.item_spots[(5, 5)] = "treasure"
+    agent.world.item_spots[(7, 5)] = "treasure"
+    agent.last_taken[(5, 5)] = now
+
+    agent._plan_exploration(5, 5, "east", energy=100)
+    assert agent.path == [], agent.path
+    assert agent.goal is None, agent.goal
+    assert agent.state == "SURVEY", agent.state
+    print("OK: killfarm defende ponto de tesouro quando esta positivo")
+
+
+def test_killfarm_surveys_while_defending_treasure():
+    from ai_agent import (DroneAgent, QUIET_FARM_AFTER, FARM_SURVEY_INTERVAL,
+                          FARM_SURVEY_TURNS)
+
+    ai = FakeAI([])
+    agent = DroneAgent(ai, log=lambda m: None)
+    now = time.time()
+    agent.strategy = "killfarm"
+    agent.last_threat_at = now - QUIET_FARM_AFTER - 1
+    agent.last_survey_at = now - FARM_SURVEY_INTERVAL - 1
+    agent.current_score = 1000
+    agent.respawn_est = 16.0
+    agent.world.update_from_observation(5, 5, [])
+    agent.world.item_spots[(5, 5)] = "treasure"
+    agent.last_taken[(5, 5)] = now
+
+    agent.do_explore(5, 5, "north", energy=100, obs=[])
+    assert ai.actions == ["d"], ai.actions
+    assert agent.state == "SURVEY", agent.state
+    assert agent.survey_turns == FARM_SURVEY_TURNS - 1, agent.survey_turns
+    print("OK: killfarm faz survey periodico enquanto defende farm")
+
+
+def test_killfarm_steps_only_does_not_loop_or_fake_block():
+    from ai_agent import DroneAgent
+
+    views = [
+        (5, 5, "north", "game", -i, 100, ["steps"])
+        for i in range(6)
+    ]
+    ai = FakeAI(views)
+    agent = DroneAgent(ai, log=lambda m: None)
+    agent.strategy = "killfarm"
+    agent.last_action = "forward"
+    agent.last_pos = (5, 5)
+
+    for _ in range(6):
+        agent.act()
+
+    assert ai.actions[:4] == ["d", "d", "d", "d"], ai.actions
+    assert agent.state == "EXPLORE", agent.state
+    assert agent.ignore_steps_until > time.time()
+    for nx, ny in ((5, 4), (6, 5), (5, 6), (4, 5)):
+        assert agent.world.grid[nx][ny] != BLOCKED, (nx, ny, agent.world.grid[nx][ny])
+    print("OK: steps sem alvo nao causa loop infinito nem bloqueio falso")
 
 
 def test_smoke_agent():
@@ -435,11 +631,22 @@ if __name__ == "__main__":
     test_world_model()
     test_fuzzy()
     test_async_notifications_are_merged()
+    test_action_delay_is_adaptive()
     test_combat_attacks_close_enemy()
+    test_combat_does_not_shoot_through_known_obstacle()
     test_combat_skips_bad_long_shot_after_misses()
     test_damage_triggers_perpendicular_evade()
     test_powerup_is_not_taken_with_high_energy()
     test_planner_prefers_higher_value_item_over_nearest()
+    test_quiet_period_camps_known_treasure_before_frontier()
+    test_kill_mode_attacks_long_enemy_and_ignores_treasure()
+    test_kill_mode_hunts_when_hearing_steps()
+    test_killfarm_mode_fights_then_farms_when_quiet()
+    test_killfarm_chases_long_enemy_when_score_is_positive()
+    test_killfarm_grabs_treasure_on_ambiguous_steps()
+    test_killfarm_defends_current_treasure_respawn()
+    test_killfarm_surveys_while_defending_treasure()
+    test_killfarm_steps_only_does_not_loop_or_fake_block()
     test_smoke_agent()
     test_pit_avoidance()
     test_stale_data_discarded()

@@ -15,11 +15,26 @@ import random
 from devkit import GameAI
 from ai_agent import DroneAgent
 
-TICK = 0.07  # intervalo entre acoes (segundos)
+TICK = 0.075          # ritmo normal: farm/exploracao
+FAST_TICK = 0.035     # ritmo de combate/perseguicao
+OPENING_TICK = 0.045  # inicio da partida: muitos bots juntos
+OPENING_FAST_SECONDS = 25.0
+ACTIVE_STATES = {"ATTACK", "CHASE", "HUNT", "EVADE"}
 
 
 def log(msg):
     print(f"{time.strftime('%H:%M:%S')} {msg}", flush=True)
+
+
+def action_delay(agent, game_started_at):
+    if game_started_at is None:
+        return TICK
+    age = time.time() - game_started_at
+    if getattr(agent, "state", "EXPLORE") in ACTIVE_STATES:
+        return FAST_TICK
+    if age <= OPENING_FAST_SECONDS:
+        return OPENING_TICK
+    return TICK
 
 
 def main():
@@ -45,6 +60,7 @@ def main():
 
     last_game_check = 0.0
     was_in_game = False
+    game_started_at = None
     try:
         while ai.connected:
             now = time.time()
@@ -59,6 +75,7 @@ def main():
             # nova partida: zera o modelo de mundo (mapa/itens podem mudar)
             if in_game and not was_in_game:
                 agent = DroneAgent(ai, log=log)
+                game_started_at = now
                 log("[JOGO] Partida iniciada: novo modelo de mundo")
             was_in_game = in_game
 
@@ -66,9 +83,11 @@ def main():
                 if ai.player_state == "dead":
                     log("[JOGO] Drone morto. Aguardando proxima rodada...")
                     time.sleep(2)
+                    continue
                 else:
                     agent.act()
             else:
+                game_started_at = None
                 # Ready/Gameover: apenas espera (comandos de controle desabilitados)
                 if "over" in status:
                     ai.send_request_scoreboard()
@@ -77,7 +96,7 @@ def main():
                 time.sleep(1)
                 continue
 
-            time.sleep(TICK)
+            time.sleep(action_delay(agent, game_started_at))
     except KeyboardInterrupt:
         log("[FIM] Interrompido pelo usuario.")
     finally:

@@ -6,8 +6,10 @@ Estados:
   EXPLORE  - explora a fronteira do mapa conhecido em busca de itens;
   GRAB     - pega item na celula atual (luz detectada);
   ATTACK   - inimigo na mira e agressividade fuzzy alta -> atira;
+  CHASE    - inimigo na mira mas longe -> avanca para fechar distancia;
   EVADE    - levou dano/ameaca perto -> sai da linha de tiro;
   HUNT     - levou dano (atirador em linha reta) -> gira procurando-o;
+  SURVEY   - varredura curta enquanto defende ponto de farm;
   RECHARGE - energia baixa -> vai ate um powerup conhecido;
   FLEE     - agressividade fuzzy baixa (fraco/ameacado) -> foge.
 
@@ -15,6 +17,7 @@ A transicao ATTACK/EVADE/HUNT/FLEE usa a 'agressividade' calculada por um
 controlador fuzzy (fuzzy.py) sobre energia e distancia do inimigo.
 """
 
+import os
 import time
 
 from world_model import (WorldModel, DIR_VECTORS, DANGEROUS, DANGER_PIT,
@@ -28,6 +31,13 @@ COUNTERFIRE_AGGR = 0.65
 LONG_SHOT_ENERGY = 75
 POWERUP_PICKUP_ENERGY = 55  # powerup nao pontua; pegar alto demais desperdiça acao
 MAX_FRONTIER_CANDIDATES = 80
+QUIET_FARM_AFTER = 6.0      # sem ameaca recente, prioriza farm/camping
+STEP_HUNT_TURNS = 4         # steps sem enemy: uma varredura completa basta
+STEP_IGNORE_AFTER_SCAN = 5.0
+DEFEND_TREASURE_MAX_WAIT = 24.0
+FARM_SURVEY_INTERVAL = 6.0
+FARM_SURVEY_TURNS = 4
+CHASE_LOST_HUNT_TURNS = 4
 
 TURN_LEFT_OF = {"north": "west", "west": "south", "south": "east", "east": "north"}
 TURN_RIGHT_OF = {"north": "east", "east": "south", "south": "west", "west": "north"}
@@ -38,6 +48,7 @@ class DroneAgent:
         self.ai = game_ai
         self.world = WorldModel()
         self.log = log
+        self.strategy = os.environ.get("DRONE_STRATEGY", "farm").lower()
         self.state = "EXPLORE"
         self.path = []            # caminho atual (lista de celulas)
         self.path_allows_flash = False
@@ -53,6 +64,11 @@ class DroneAgent:
         # economia de combate: desengaja apos varios tiros sem acerto
         self.shots_since_hit = 0
         self.engage_pause_until = 0.0
+        self.last_threat_at = time.time()
+        self.ignore_steps_until = 0.0
+        self.current_score = 0
+        self.last_survey_at = 0.0
+        self.survey_turns = 0
         # economia de acoes: instante em que ficamos sem alvos
         self.idle_since = None
         # farming: estimativa adaptativa do tempo de respawn dos itens e
@@ -106,6 +122,15 @@ class DroneAgent:
             current = nxt
             current_dir = next_dir
         return cost
+
+    def _kill_mode(self):
+        return self.strategy == "kill"
+
+    def _killfarm_mode(self):
+        return self.strategy in ("killfarm", "huntfarm", "hybrid")
+
+    def _combat_first_mode(self):
+        return self._kill_mode() or self._killfarm_mode()
 
     def _item_value(self, pos, energy, now):
         kind = self.world.item_spots.get(pos, "unknown")
@@ -163,8 +188,103 @@ class DroneAgent:
                 best = (score, target, path, cost)
         return best
 
+    def _threat_seen(self, obs_l):
+        return (
+            "steps" in obs_l or "damage" in obs_l or "hit" in obs_l or
+            any(o.startswith(("enemy", "eneny")) for o in obs_l)
+        )
+
+    def _steps_only(self, obs_l):
+        return (
+            "steps" in obs_l and
+            "damage" not in obs_l and
+            "hit" not in obs_l and
+            not any(o.startswith(("enemy", "eneny")) for o in obs_l)
+        )
+
+    def _quiet_for_farm(self, now):
+        return now - self.last_threat_at >= QUIET_FARM_AFTER
+
+    def _farm_camp_targets(self):
+        return [
+            pos for pos, kind in self.world.item_spots.items()
+            if kind in ("treasure", "unknown")
+        ]
+
+    def _camp_value(self, pos, cost, now):
+        kind = self.world.item_spots.get(pos, "unknown")
+        base = 1000.0 if kind == "treasure" else 650.0
+        last = self.last_taken.get(pos)
+        wait = 0.0 if last is None else max(0.0, self.respawn_est - (now - last))
+        # Esperar parado e gratis, mas em servidor cheio esperar demais aumenta
+        # chance de outro bot levar o respawn. Penaliza espera, nao proibe camping.
+        return base - cost * 1.5 - wait * 6.0
+
+    def _should_defend_current_camp(self, pos, now):
+        if pos not in self._farm_camp_targets() or pos not in self.last_taken:
+            return False
+        wait = max(0.0, self.respawn_est - (now - self.last_taken[pos]))
+        if self.current_score < 0:
+            return wait <= 8.0
+        return wait <= DEFEND_TREASURE_MAX_WAIT
+
+    def _survey_due(self, now):
+        return self._killfarm_mode() and \
+            now - self.last_survey_at >= FARM_SURVEY_INTERVAL
+
+    def _start_survey(self, now, reason):
+        self.state = "SURVEY"
+        self.survey_turns = FARM_SURVEY_TURNS
+        self.last_survey_at = now
+        self.log(f"[SURVEY] {reason}: varrendo arredores")
+
+    def _front_cell(self, x, y, d):
+        vx, vy = DIR_VECTORS.get(d, (0, 0))
+        return x + vx, y + vy
+
+    def _can_chase_forward(self, x, y, d):
+        nx, ny = self._front_cell(x, y, d)
+        if not in_bounds(nx, ny):
+            return False
+        cell = self.world.grid[nx][ny]
+        if cell == BLOCKED or cell in DANGEROUS:
+            return False
+        if self.world.pit_risk(nx, ny) > 1:
+            return False
+        return self.world.is_walkable(nx, ny, allow_unknown=True)
+
+    def _line_of_fire_clear(self, x, y, d, enemy_dist):
+        if enemy_dist is None:
+            return False
+        vx, vy = DIR_VECTORS.get(d, (0, 0))
+        for step in range(1, enemy_dist + 1):
+            tx, ty = x + vx * step, y + vy * step
+            if not in_bounds(tx, ty):
+                return False
+            if self.world.grid[tx][ty] == BLOCKED:
+                return False
+        return True
+
     def _miss_limit(self, enemy_dist):
         """Quanto mais longe o alvo, menor a tolerancia a tiros sem hit."""
+        if self._kill_mode():
+            if enemy_dist is None:
+                return 4
+            if enemy_dist <= 4:
+                return 12
+            if enemy_dist <= 8:
+                return 8
+            return 5
+        if self._killfarm_mode():
+            if enemy_dist is None:
+                return 2
+            if enemy_dist <= 4:
+                return 10
+            if enemy_dist <= 6:
+                return 5
+            if enemy_dist <= 8:
+                return 3
+            return 1
         if enemy_dist is None:
             return 2
         if enemy_dist <= 3:
@@ -177,6 +297,25 @@ class DroneAgent:
         """Decide se o tiro vale o custo (-10) neste tick."""
         obs_l = [o.lower() for o in obs]
         if enemy_dist is None:
+            return False
+        if self._kill_mode():
+            return energy > 0 and enemy_dist <= 10
+        if self._killfarm_mode():
+            if "damage" in obs_l and energy <= LOW_ENERGY:
+                return False
+            if self.shots_since_hit >= self._miss_limit(enemy_dist):
+                return False
+            if "hit" in obs_l:
+                return energy > LOW_ENERGY and enemy_dist <= 8
+            if energy <= CRITICAL_ENERGY:
+                return enemy_dist <= 2 and self.aggr >= 0.35
+            if enemy_dist <= 4:
+                return energy > CRITICAL_ENERGY
+            if enemy_dist <= 6:
+                return energy >= 45 and self.aggr >= 0.45
+            if enemy_dist <= 8:
+                score_pressure = self.current_score < 0
+                return energy >= 80 and self.shots_since_hit == 0 and score_pressure
             return False
         if "hit" in obs_l:
             return energy > CRITICAL_ENERGY and enemy_dist <= 8
@@ -228,7 +367,13 @@ class DroneAgent:
         enemy_dist = self.enemy_distance(obs)
         obs_l = [o.lower() for o in obs]
         took_damage = "damage" in obs_l
-        hears_steps = "steps" in obs_l
+        now = time.time()
+        steps_only = self._steps_only(obs_l)
+        if enemy_dist is not None or took_damage or "hit" in obs_l:
+            self.ignore_steps_until = 0.0
+        hears_steps = "steps" in obs_l and not (
+            steps_only and now < self.ignore_steps_until
+        )
 
         # a LUZ observada e a verdade do servidor: se ha luz, ha item AGORA
         # (essencial para farming de respawns). Guarda anti-spam evita pegar
@@ -243,7 +388,9 @@ class DroneAgent:
             light = None
         has_item = light is not None and \
             (light != "powerup" or energy <= POWERUP_PICKUP_ENERGY) and \
-            time.time() - self.last_grab.get((x, y), 0) > 0.6
+            now - self.last_grab.get((x, y), 0) > 0.6
+        threat_now = enemy_dist is not None or took_damage or hears_steps
+        ambiguous_steps = steps_only and enemy_dist is None and not took_damage
 
         # agressividade fuzzy: energia x distancia do inimigo. Sem inimigo
         # visivel, dano/steps implicam inimigo perto (dist ~2); senao longe.
@@ -255,11 +402,26 @@ class DroneAgent:
             assumed_dist = 10
         self.aggr = combat_aggressiveness(energy, assumed_dist)
 
-        # item embaixo do drone vale sempre: pegar custa 1 acao
-        if has_item:
+        # item embaixo do drone vale sempre no modo farm; no modo killfarm so
+        # quando nao ha ameaca por perto.
+        if has_item and (
+                not self._combat_first_mode() or
+                (self._killfarm_mode() and (not threat_now or ambiguous_steps))):
+            return "GRAB"
+        if self._combat_first_mode() and light == "powerup" and \
+                energy <= CRITICAL_ENERGY and \
+                now - self.last_grab.get((x, y), 0) > 0.6:
             return "GRAB"
         if enemy_dist is not None:
             # desengajado por excesso de tiros errados? ignora e segue
+            if self._combat_first_mode():
+                if took_damage and energy <= LOW_ENERGY:
+                    return "EVADE"
+                if self._should_attack(energy, enemy_dist, obs):
+                    return "ATTACK"
+                if self._killfarm_mode():
+                    return "EVADE" if energy <= LOW_ENERGY else "CHASE"
+                return "HUNT"
             if time.time() < self.engage_pause_until and "hit" not in obs_l:
                 return "EVADE" if took_damage or enemy_dist <= 2 else "EXPLORE"
             if took_damage and self.aggr < COUNTERFIRE_AGGR:
@@ -274,9 +436,17 @@ class DroneAgent:
         if took_damage:
             # levamos tiro: o atirador esta em linha reta conosco
             return "EVADE"
+        if self.state == "SURVEY" and self.survey_turns > 0:
+            return "SURVEY"
+        if self.state == "HUNT" and self.hunt_turns > 0:
+            return "HUNT"
+        if self._combat_first_mode() and hears_steps:
+            return "HUNT"
         if hears_steps and self.aggr < 0.25:
             return "FLEE"
-        if energy <= LOW_ENERGY and self._due_spots(("powerup",), energy=0):
+        if (not self._combat_first_mode() or self._killfarm_mode()) and \
+                energy <= LOW_ENERGY and \
+                self._due_spots(("powerup",), energy=0):
             return "RECHARGE"
         return "EXPLORE"
 
@@ -311,9 +481,14 @@ class DroneAgent:
         x, y, d, pstate, score, energy, obs = view
         if x < 0:
             return  # ainda sem posicao valida
+        self.current_score = score
 
         self.tick_count += 1
         obs_l = [o.lower() for o in obs]
+        now = time.time()
+        if self._threat_seen(obs_l) and not (
+                self._steps_only(obs_l) and now < self.ignore_steps_until):
+            self.last_threat_at = now
 
         # impacto: a celula a frente esta bloqueada
         if "blocked" in obs_l:
@@ -368,8 +543,10 @@ class DroneAgent:
             "EXPLORE": self.do_explore,
             "GRAB": self.do_grab,
             "ATTACK": self.do_attack,
+            "CHASE": self.do_chase,
             "EVADE": self.do_evade,
             "HUNT": self.do_hunt,
+            "SURVEY": self.do_survey,
             "RECHARGE": self.do_recharge,
             "FLEE": self.do_flee,
         }[self.state]
@@ -378,6 +555,7 @@ class DroneAgent:
     def do_grab(self, x, y, d, energy, obs):
         kind = self.world.item_spots.get((x, y), "item")
         self.ai.send_get_item()
+        self.last_action = "grab"
         now = time.time()
         self.log(f"[ACAO] Pegar item ({kind}) em ({x},{y})")
         self.world.consume_item(x, y)
@@ -389,17 +567,32 @@ class DroneAgent:
         # economia de municao: tiro custa -10; matar (+1000) exige 10 acertos.
         # Se erramos varios seguidos (inimigo desviando), desengajamos.
         enemy_dist = self.enemy_distance(obs)
+        if not self._line_of_fire_clear(x, y, d, enemy_dist):
+            self.shots_since_hit = 0
+            self.state = "HUNT" if self._combat_first_mode() else "EXPLORE"
+            self.log("[COMBATE] Obstaculo conhecido na linha de tiro: segurando fogo")
+            return
         if not self._should_attack(energy, enemy_dist, obs):
             obs_l = [o.lower() for o in obs]
-            self.state = "EVADE" if "damage" in obs_l else "EXPLORE"
+            self.state = "EVADE" if "damage" in obs_l else \
+                ("HUNT" if self._combat_first_mode() else "EXPLORE")
             return
         if "hit" in [o.lower() for o in obs]:
             self.shots_since_hit = 0
         self.ai.send_shoot()
+        self.last_action = "shoot"
         self.shots_since_hit += 1
         dist = enemy_dist if enemy_dist is not None else "?"
         self.log(f"[ACAO] ATIRAR! Inimigo a frente (dist={dist}) energia={energy} "
                  f"tiros_sem_acerto={self.shots_since_hit}")
+        if self._combat_first_mode():
+            if self.shots_since_hit >= self._miss_limit(enemy_dist):
+                self.shots_since_hit = 0
+                self.state = "HUNT"
+                self.log("[KILLFARM] Alvo saiu da linha: girando para reacquirir"
+                         if self._killfarm_mode() else
+                         "[KILL] Alvo saiu da linha: girando para reacquirir")
+            return
         miss_limit = self._miss_limit(enemy_dist)
         if self.shots_since_hit >= miss_limit:
             pause = 4 if enemy_dist is not None and enemy_dist <= 6 else 6
@@ -408,6 +601,35 @@ class DroneAgent:
             self.state = "EXPLORE"
             self.log(f"[FSM] {miss_limit} tiros sem acerto: "
                      f"desengajando por {pause}s (economia)")
+
+    def do_chase(self, x, y, d, energy, obs):
+        """Fecha distancia quando ha inimigo na linha, atirando ao ficar perto."""
+        enemy_dist = self.enemy_distance(obs)
+        if enemy_dist is None:
+            self.hunt_turns = CHASE_LOST_HUNT_TURNS
+            self.state = "HUNT"
+            self.log("[CHASE] Alvo saiu da mira: varrendo para reacquirir")
+            self.do_hunt(x, y, d, energy, obs)
+            return
+        if self._should_attack(energy, enemy_dist, obs):
+            self.state = "ATTACK"
+            self.do_attack(x, y, d, energy, obs)
+            return
+        if energy <= LOW_ENERGY:
+            self.state = "RECHARGE" if self._due_spots(("powerup",), energy=0) \
+                else "EVADE"
+            return
+        if self._can_chase_forward(x, y, d):
+            target = self._front_cell(x, y, d)
+            self.ai.send_forward()
+            self.last_action = "forward"
+            self.log(f"[CHASE] Avancar para fechar distancia "
+                     f"(enemy_dist={enemy_dist}) -> {target}")
+            return
+        self.hunt_turns = CHASE_LOST_HUNT_TURNS
+        self.state = "HUNT"
+        self.log("[CHASE] Caminho frontal inseguro/bloqueado: girando para rota")
+        self.do_hunt(x, y, d, energy, obs)
 
     def do_evade(self, x, y, d, energy, obs):
         """Sai da linha de tiro antes de caçar ou voltar ao farming."""
@@ -427,13 +649,39 @@ class DroneAgent:
             self.state = "HUNT" if energy > LOW_ENERGY and "steps" in obs_l else "EXPLORE"
 
     def do_hunt(self, x, y, d, energy, obs):
-        # gira procurando o inimigo; se der 4 voltas sem achar, volta a explorar
+        # gira procurando o inimigo. "steps" sozinho pode significar inimigo
+        # diagonal/fora da linha: varre uma vez e depois volta a farmar.
+        obs_l = [o.lower() for o in obs]
+        steps_only = self._steps_only(obs_l)
         if self.hunt_turns <= 0:
-            self.hunt_turns = 4
+            self.hunt_turns = STEP_HUNT_TURNS if (
+                self._combat_first_mode() and steps_only
+            ) else (8 if self._combat_first_mode() else 4)
         self.ai.send_turn_right()
-        self.log("[ACAO] Procurando inimigo (girar a direita)")
+        self.last_action = "turn"
+        self.log(("[KILLFARM] Procurando inimigo (girar a direita)"
+                  if self._killfarm_mode() else
+                  "[KILL] Procurando inimigo (girar a direita)")
+                 if self._combat_first_mode() else
+                 "[ACAO] Procurando inimigo (girar a direita)")
         self.hunt_turns -= 1
         if self.hunt_turns == 0:
+            self.state = "EXPLORE"
+            if self._combat_first_mode() and steps_only:
+                self.ignore_steps_until = time.time() + STEP_IGNORE_AFTER_SCAN
+                self.log("[KILLFARM] Steps sem alvo na mira: voltando ao farm"
+                         if self._killfarm_mode() else
+                         "[KILL] Steps sem alvo na mira: reposicionando")
+
+    def do_survey(self, x, y, d, energy, obs):
+        if self.survey_turns <= 0:
+            self.state = "EXPLORE"
+            return
+        self.ai.send_turn_right()
+        self.last_action = "turn"
+        self.survey_turns -= 1
+        self.log("[SURVEY] Olhando ao redor do ponto de farm")
+        if self.survey_turns == 0:
             self.state = "EXPLORE"
 
     def do_flee(self, x, y, d, energy, obs):
@@ -499,16 +747,46 @@ class DroneAgent:
 
     def do_explore(self, x, y, d, energy, obs):
         if not self.path:
-            self._plan_exploration(x, y, d, energy)
+            if self._kill_mode():
+                self._plan_kill_sweep(x, y, d)
+            else:
+                self._plan_exploration(x, y, d, energy)
+            if self.state == "SURVEY":
+                self.do_survey(x, y, d, energy, obs)
+                return
         self._follow_path(x, y, d)
+
+    def _plan_kill_sweep(self, x, y, d):
+        """Modo agressivo: usa exploracao so para varrer mapa e encontrar alvo."""
+        start = (x, y)
+        frontier = self.world.frontier_cells()
+        self.path_allows_flash = False
+        if frontier:
+            candidates = self._frontier_candidates(start, frontier)
+            plan = self._best_scored_plan(
+                start, d, candidates,
+                lambda target, path, cost: self._frontier_info_gain(target) * 110 - cost)
+            if plan is not None:
+                _, goal, path, cost = plan
+                self.goal = goal
+                self.path = path
+                self.idle_since = None
+                self.log(f"[KILL] Varrendo mapa rumo a {goal} "
+                         f"({len(path)} passos, custo={cost})")
+                return
+
+        self.state = "HUNT"
+        self.hunt_turns = 8
+        self.log("[KILL] Sem fronteira: varrendo visao no giro")
 
     def _plan_exploration(self, x, y, d, energy):
         """Prioridades (estrategia de farming — itens reaparecem):
         1. FARM: ponto de item conhecido provavelmente disponivel;
-        2. EXPLORAR: fronteira do desconhecido (descobre novos pontos);
-        3. ACAMPAR: parar sobre o ponto de tesouro mais 'maduro' e esperar
+        2. MODO QUIETO: sem ameaca recente, voltar cedo a ponto de tesouro;
+        3. EXPLORAR: fronteira do desconhecido (descobre novos pontos);
+        4. ACAMPAR: parar sobre o ponto de tesouro mais 'maduro' e esperar
            o respawn (esperar e gratis; pegar custa 1 acao e rende +1000);
-        4. ESPERAR: nada alcancavel — economizar acoes."""
+        5. ESPERAR: nada alcancavel — economizar acoes."""
         now = time.time()
         due = [p for p in self._due_spots(("treasure", "unknown", "powerup"),
                                           energy) if p != (x, y)]
@@ -516,6 +794,18 @@ class DroneAgent:
 
         start = (x, y)
         self.path_allows_flash = False
+
+        if self._should_defend_current_camp(start, now) and self._quiet_for_farm(now):
+            if self._survey_due(now):
+                self._start_survey(now, f"Defendendo ponto {start}")
+                return
+            if self.idle_since is None:
+                self.idle_since = now
+                wait = max(0.0, self.respawn_est - (now - self.last_taken[start]))
+                self.log(f"[FARM] Defendendo ponto {start} "
+                         f"(respawn estimado em {wait:.0f}s)")
+            return
+
         if due:
             plan = self._best_scored_plan(
                 start, d, due,
@@ -527,6 +817,29 @@ class DroneAgent:
                 self.idle_since = None
                 self.log(f"[FARM] Rumo a {goal} ({len(path)} passos, custo={cost})")
                 return
+
+        quiet_farm_targets = [p for p in self._farm_camp_targets() if p != start]
+        if quiet_farm_targets and self._quiet_for_farm(now):
+            plan = self._best_scored_plan(
+                start, d, quiet_farm_targets,
+                lambda target, path, cost: self._camp_value(target, cost, now))
+            if plan is not None:
+                _, goal, path, cost = plan
+                self.goal = goal
+                self.path = path
+                self.idle_since = None
+                self.log(f"[FARM] Periodo quieto: acampando cedo em {goal} "
+                         f"({len(path)} passos, custo={cost})")
+                return
+
+        if start in self._farm_camp_targets() and self._quiet_for_farm(now):
+            if self._survey_due(now):
+                self._start_survey(now, f"Segurando ponto {start}")
+                return
+            if self.idle_since is None:
+                self.idle_since = now
+                self.log(f"[FARM] Periodo quieto: segurando ponto {start}")
+            return
 
         if frontier:
             candidates = self._frontier_candidates(start, frontier)
