@@ -1,4 +1,11 @@
-"""Normalization and structured access for GameServer observations."""
+"""Traduz a lista crua de tokens que o servidor manda em algo legível.
+
+O servidor varia a grafia das observações (`blueLight`, `eneny#3` em vez de
+`enemy#3`, etc.) e cada `ai_agent` original reimplementava essa limpeza à
+sua maneira. Aqui isso acontece uma vez só, e o resto do código lê a
+`Observation` resultante por nome (`observation.damage`, `observation.light`)
+em vez de vasculhar strings.
+"""
 
 from dataclasses import dataclass, field
 
@@ -10,26 +17,17 @@ LIGHT_TOKENS = {
     "greenlight": "poison",
 }
 
-KNOWN_FLAGS = {
-    "blocked",
-    "steps",
-    "breeze",
-    "flash",
-    "damage",
-    "hit",
-    "bluelight",
-    "redlight",
-    "greenlight",
-    "weaklight",
-}
-
 
 def _clean(token):
     return token.strip().replace(" ", "").lower()
 
 
 def normalize_token(token):
-    """Return a canonical lowercase token or None for empty tokens."""
+    """Converte um token cru para a forma canônica, ou None se vazio.
+
+    Cobre as variações conhecidas do protocolo: `h`/`d` como atalho para
+    hit/damage, `eneny#N` como grafia alternativa de `enemy#N`, e distância
+    de inimigo malformada caindo num valor padrão em vez de quebrar."""
     low = _clean(str(token))
     if not low:
         return None
@@ -66,7 +64,7 @@ def normalize_tokens(tokens):
 
 @dataclass(frozen=True)
 class Observation:
-    """Structured view of the server's observation tokens."""
+    """Visão estruturada e imutável de uma leitura de sensores."""
 
     tokens: tuple = field(default_factory=tuple)
 
@@ -77,9 +75,6 @@ class Observation:
     @property
     def as_list(self):
         return list(self.tokens)
-
-    def has(self, token):
-        return normalize_token(token) in self.tokens
 
     @property
     def blocked(self):
@@ -107,6 +102,7 @@ class Observation:
 
     @property
     def enemy_distance(self):
+        """Distância do inimigo avistado, ou None se nenhum estiver visível."""
         for token in self.tokens:
             if token.startswith("enemy#"):
                 try:
@@ -121,6 +117,7 @@ class Observation:
 
     @property
     def light(self):
+        """"treasure"/"powerup"/"unknown"/"poison", ou None sem luz nenhuma."""
         for token, kind in LIGHT_TOKENS.items():
             if token in self.tokens:
                 return kind
@@ -130,20 +127,10 @@ class Observation:
     def has_item(self):
         return self.light in ("treasure", "powerup", "unknown")
 
-    @property
-    def async_events(self):
-        return [t for t in self.tokens if t in ("hit", "damage")]
-
-    @property
-    def environment_tokens(self):
-        return [t for t in self.tokens if t not in ("hit", "damage")]
-
-    @property
-    def steps_only(self):
-        return self.steps and not self.damage and not self.hit and not self.enemy
-
 
 def parse_observation_payload(payload):
+    """Constrói uma Observation a partir do payload cru de uma mensagem
+    'o' do servidor (string separada por vírgulas)."""
     if payload is None or payload == "":
         return Observation()
     return Observation.from_tokens(str(payload).split(","))

@@ -1,4 +1,11 @@
-"""Economic item collection and respawn farming strategy."""
+"""Decide onde vale mais a pena farmar ou explorar.
+
+A ideia central é `farm_utility`: cada ponto de item conhecido (ou célula de
+fronteira ainda inexplorada) é avaliado por "valor a receber por segundo
+gasto até lá" — deslocamento até o alvo, espera até ele amadurecer e o custo
+da própria coleta entram na conta. `choose_plan` ranqueia tudo isso numa
+única varredura e devolve o melhor destino.
+"""
 
 import time
 
@@ -16,24 +23,20 @@ EARLY_FARM_DISCOUNT = 0.25
 FRONTIER_INFO_WEIGHT = 0.15
 PENDING_GRAB_TIMEOUT = 1.2
 POWERUP_PICKUP_ENERGY = 70
-# A escolha de alvo penalizava risco com um desconto FIXO (cell_penalty*0.05,
-# no maximo ~3.5 de uma ameaca recente de ate 70): irrelevante frente a
-# utilidades na casa das centenas/milhares, e mesmo corrigido para um peso
-# maior continuaria irrelevante, porque farm_utility() (valor/segundo) cresce
-# muito rapido para alvos proximos -- um alvo 1 passo mais perto ja vale
-# centenas de pontos a mais, o que nenhum desconto fixo de ate 70 supera.
-# Por isso o desconto por ameaca recente agora e MULTIPLICATIVO (corta uma
-# fracao do valor do proprio alvo, nao um numero fixo), e so risco de
-# poco/teleporte/revisita continua como desconto fixo (esses nao dependem de
-# comparar com um alvo mais proximo, so afinam a rota).
-# Sobrevivencia importa em toda partida (o enunciado encerra a partida do
-# agente ao morrer, nao so desconta -10), entao ameaca recente precisa pesar
-# de verdade na escolha do alvo, nao so na fuga reativa.
+
+# Ameaça recente corta uma FRAÇÃO do valor do alvo (não um número fixo): como
+# farm_utility() cresce rápido para alvos próximos, um desconto fixo nunca
+# seria grande o bastante para preferir um alvo mais seguro só um pouco mais
+# longe. Risco de poço/teleporte/revisita, que não precisa competir com essa
+# escala, continua descontado como valor fixo — só afina a rota.
 DANGER_AVOIDANCE_FRACTION = 0.85
 ROUTE_PENALTY_WEIGHT = 0.3
 
 
 class FarmManager:
+    """Aprende o valor real de cada ponto de item (a partir do placar) e
+    decide se o momento é de farmar, explorar ou esperar um respawn."""
+
     def __init__(self, world, planner, risk, log=print):
         self.world = world
         self.planner = planner
@@ -51,13 +54,18 @@ class FarmManager:
         self.collect_by_kind = {}
 
     def reset(self):
+        """Esquece tudo o que foi aprendido (nova partida, mapa novo)."""
         self.__init__(self.world, self.planner, self.risk, self.log)
 
     def known_treasure_spots(self):
+        """Quantos pontos de tesouro/desconhecido já foram descobertos."""
         return sum(1 for k in self.world.item_spots.values()
                    if k in ("treasure", "unknown"))
 
     def early_explore_pressure(self, now=None):
+        """Peso em [0, 1]: quanto ainda vale a pena priorizar explorar em
+        vez de farmar. Alto no início da partida e enquanto poucos pontos de
+        item são conhecidos; cai conforme o tempo passa ou o mapa se revela."""
         now = now or time.time()
         known = self.known_treasure_spots()
         time_left = max(0.0, 1.0 - (now - self.start_time) / EARLY_EXPLORE_SECONDS)
@@ -65,11 +73,15 @@ class FarmManager:
         return max(time_left, 0.8 * item_gap)
 
     def frontier_info_gain(self, pos):
+        """Quanto uma célula de fronteira promete revelar do mapa (mais
+        vizinhos desconhecidos/seguros ao redor = melhor alvo de exploração)."""
         unknown_adj = sum(1 for n in neighbors(*pos) if self.world.grid[n[0]][n[1]] == UNKNOWN)
         safe_adj = sum(1 for n in neighbors(*pos) if self.world.grid[n[0]][n[1]] == SAFE)
         return 1.0 + unknown_adj + 0.5 * safe_adj
 
     def due_spots(self, kinds, energy, now=None):
+        """Pontos conhecidos que já devem ter reaparecido (nunca coletados,
+        ou coletados há mais tempo que o respawn estimado)."""
         now = now or time.time()
         out = []
         for pos, kind in self.world.item_spots.items():
@@ -85,6 +97,10 @@ class FarmManager:
         return out
 
     def farm_utility(self, pos, kind, dist_steps, now=None):
+        """Valor esperado por segundo de ir buscar o item em `pos`: o valor
+        do item dividido pelo tempo até poder pegá-lo (viagem + espera até
+        amadurecer + a própria coleta). É o que compara farmar com explorar
+        numa régua só."""
         now = now or time.time()
         respawn = self.spot_respawn.get(pos, RESPAWN_DEFAULT)
         last = self.last_taken.get(pos)
@@ -97,6 +113,9 @@ class FarmManager:
         return value / max(total, SEC_PER_ACTION)
 
     def has_collectable_item(self, pos, observation, energy, now=None):
+        """Há luz na célula atual e vale a pena pegar agora (não é um
+        powerup desperdiçado com energia cheia, nem uma coleta repetida
+        antes do servidor confirmar a anterior)."""
         now = now or time.time()
         if not observation.has_item:
             return False
@@ -105,6 +124,8 @@ class FarmManager:
         return now - self.last_grab.get(pos, 0) > 0.6
 
     def record_grab(self, pos, score, now=None):
+        """Registra a coleta: agenda o próximo respawn esperado e guarda o
+        placar de antes para `resolve_pending_grabs` aprender o valor real."""
         now = now or time.time()
         kind = self.world.item_spots.get(pos, self.world.items.get(pos, "item"))
         self.world.consume_item(*pos)
@@ -118,6 +139,11 @@ class FarmManager:
         self.log(f"[COLETA] {kind} em {pos} | total={self.collect_count}")
 
     def resolve_pending_grabs(self, score, now=None):
+        """Confere o placar depois de cada coleta pendente e aprende o
+        ganho líquido real de cada ponto (em vez de confiar só na tabela
+        `ITEM_VALUE`). Coletas próximas em sequência usam o placar da
+        próxima da fila como referência, então nenhuma perde a amostra por
+        ainda não ter sido confirmada."""
         now = now or time.time()
         ordered = sorted(self.pending_grabs, key=lambda item: item[2])
         still = []
@@ -134,6 +160,9 @@ class FarmManager:
         self.pending_grabs = still
 
     def observe_respawn(self, pos, observation, now=None):
+        """Ajusta a estimativa de respawn de `pos` pelo que a luz mostra
+        agora: se reapareceu mais rápido que o esperado, aprende um tempo
+        menor; se ainda não reapareceu, adia a próxima checagem."""
         now = now or time.time()
         if pos not in self.world.item_spots:
             return
@@ -171,6 +200,8 @@ class FarmManager:
         return value
 
     def next_check_at(self, pos, now=None):
+        """Quando vale a pena olhar de novo para `pos` (usado pelo CAMP para
+        não ficar pedindo observação toda hora enquanto espera de graça)."""
         now = now or time.time()
         if pos not in self.world.item_spots:
             return None
@@ -181,6 +212,11 @@ class FarmManager:
         return self.last_taken[pos] + self.spot_respawn.get(pos, RESPAWN_DEFAULT)
 
     def choose_plan(self, start, direction, energy, allow_flash=False):
+        """Escolhe o melhor destino agora: entre todo ponto de item já
+        maduro e toda célula de fronteira, o de maior `farm_utility`/
+        `frontier_info_gain` (descontado o risco) vence. Retorna None se
+        nada vale a pena, ou um dict com o rótulo ("FARM"/"PLANO"/"CAMP"),
+        o alvo, o caminho até ele e a utilidade calculada."""
         now = time.time()
         dist, parent = self.planner.reachable_map(start, allow_flash=allow_flash)
         frontier = self.world.frontier_cells()
@@ -229,6 +265,8 @@ class FarmManager:
         return {"label": label, "goal": goal, "path": path, "utility": utility}
 
     def has_better_reachable_plan(self, start, direction, energy, margin=1.20):
+        """True se existe um alvo bem melhor (20% acima) que ficar parado
+        aqui coletando — usado para decidir se vale sair do CAMP atual."""
         current_kind = self.world.item_spots.get(start)
         if current_kind not in ("treasure", "unknown"):
             return False

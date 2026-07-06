@@ -1,145 +1,93 @@
 # drone-ai-agent
 
-Agente inteligente para o desafio final de IA da INF1771: um drone autonomo
-controlado por Socket TCP/IP que explora um labirinto 59 x 34 desconhecido,
-coleta tesouros, evita pocos e teleportes, gerencia energia e combate outros
-drones quando a relacao risco/beneficio compensa.
+Agente de IA para o desafio final da disciplina INF1771 (PUC-Rio): um drone
+autônomo controlado via socket TCP/IP que explora um labirinto 59×34
+desconhecido, aprende onde e quando os tesouros reaparecem, evita poços e
+teleportes, e reage a combate quando faz sentido — sempre priorizando
+sobreviver e farmar em vez de caçar (matar um inimigo custa munição e coloca
+o drone em risco; morrer encerra a participação do agente na partida).
 
 ## Arquitetura
 
-O projeto foi consolidado em modulos pequenos e integrados, mas a decisao
-principal fica no comportamento do agente: o loop local pode rodar sem enviar
-comandos quando a melhor opcao economica e esperar.
+O agente é dividido em módulos pequenos, cada um dono de uma parte do
+problema. `strategy.DroneAgent` é quem amarra tudo: a cada tick, pergunta ao
+mundo o que já se sabe, ao risco o quão perigosa está a vizinhança, ao farm
+qual o melhor destino e ao combate o que fazer com um inimigo por perto — e
+a partir disso escolhe um estado e age.
 
 | Arquivo | Responsabilidade |
 |---|---|
-| `src/main.py` | CLI, perfis estrategicos, conexao, loop de partida, reset e tick adaptativo |
-| `src/communication.py` | Cliente TCP/IP, protocolo do servidor, requisicoes sincronas e eventos assincronos |
-| `src/observations.py` | Normalizacao e representacao estruturada das observacoes |
-| `src/world_model.py` | Mapa 59 x 34, memoria da partida, inferencia Wumpus e consultas de risco |
-| `src/risk.py` | Memoria temporal de ameacas e penalidades de risco |
-| `src/planner.py` | BFS global, busca multi-alvo, A* com orientacao e cache de rotas |
-| `src/farm.py` | Farming por utilidade economica, respawn por ponto e coletas pendentes |
-| `src/combat.py` | Combate tatico, linha de tiro, misses, `CHASE`, `EVADE` e perfis |
-| `src/strategy.py` | FSM comportamental, politica economica de observacao e metricas |
-| `src/ai_agent.py` | Wrapper de compatibilidade para `DroneAgent` |
-| `src/devkit.py` | Wrapper de compatibilidade para `GameAI` |
+| `src/main.py` | Ponto de entrada: conexão, loop da partida, reinício a cada nova partida |
+| `src/communication.py` | Cliente TCP/IP e protocolo do servidor (comandos, eventos assíncronos) |
+| `src/observations.py` | Normalização das observações cruas do servidor |
+| `src/world_model.py` | Mapa 59×34, inferência estilo Mundo de Wumpus, buscas A*/BFS |
+| `src/risk.py` | Memória de ameaça e pontuação de risco de célula |
+| `src/planner.py` | Fachada de busca de caminho (A* com cache, fuga, fallback de teleporte) |
+| `src/farm.py` | Decide onde farmar/explorar por utilidade econômica |
+| `src/combat.py` | Decide como reagir a um inimigo (atacar, perseguir, fugir, esquivar) |
+| `src/strategy.py` | A máquina de estados que liga tudo isso e decide a ação de cada tick |
 | `src/fuzzy.py` | Controlador fuzzy de agressividade em combate |
 
-## Decisoes Tecnicas
+## Por que o agente se comporta assim
 
-- `hit` e `damage` recebidos fora da resposta de observacao ficam em
-  `pending_observations` e sao mesclados na proxima observacao real.
-- `steps` gera cautela temporaria, mas nao marca uma celula como perigo
-  permanente. Apenas `damage` ou inimigo visivel muito perto alimentam
-  `danger_cells`.
-- Pocos suspeitos nunca sao atravessados. Teleporte suspeito so entra como
-  fallback quando nao ha plano seguro ou o agente esta preso.
-- A exploracao usa inferencia estilo Mundo de Wumpus para `breeze` e `flash`.
-- O farming escolhe alvos por utilidade esperada por tempo, considerando
-  deslocamento, espera ate respawn, valor aprendido e custo de coleta.
-- O combate valida linha de tiro antes de disparar e interrompe sequencias de
-  tiros sem `hit`.
-- A fuga escolhe somente destinos comprovadamente alcancaveis por BFS/A*.
-- O mapa e toda memoria especifica sao reiniciados a cada nova partida.
-- `act()` nao envia mais `q` e `o` por padrao. O agente observa quando ha
-  motivo: apos movimento/rotacao, tiro, bloqueio, evento assincrono, dado
-  desatualizado, decisao de risco ou janela provavel de respawn.
-- Durante camping/respawn, a espera local e gratuita: o agente acompanha o
-  relogio local e so consulta o servidor perto da janela estimada.
-- `CHASE` bloqueado nao volta imediatamente para `HUNT/CHASE`: o agente
-  registra a falha, aplica cooldown para o par posicao/direcao/bloqueio,
-  tenta reposicionamento lateral seguro e abandona/retoma objetivo economico
-  quando nao ha progresso.
-- Metricas de comandos, observacoes, tiros, coletas, loops e espera sem comando
-  ficam disponiveis por `agent.metrics_snapshot()` e no resumo final.
+- **Sobreviver é a prioridade.** O enunciado encerra a participação do
+  agente na partida quando ele morre — morrer custa muito mais que o -10 do
+  placar, custa todo o farm que sobrava fazer. Por isso o combate é
+  reativo (o agente não sai caçando), e uma ameaça recente pesa de verdade
+  na escolha de para onde farmar/explorar, não só na hora de fugir.
+- **Farm por utilidade, não por distância.** Cada ponto de item conhecido é
+  avaliado por valor esperado *por segundo* até conseguir pegá-lo (viagem +
+  espera até amadurecer). Isso naturalmente equilibra farmar pontos já
+  maduros com explorar em busca de novos.
+- **O mapa é aprendido, nunca dado.** `breeze`/`flash` só dizem que existe
+  um poço/teleporte em algum vizinho; por eliminação, quando sobra um único
+  candidato ele vira confirmado. Célula suspeita de poço nunca é pisada.
+- **Comunicação sob demanda.** `q`/`o` só são pedidos quando algo realmente
+  mudou (depois de mover/girar/atirar/pegar) ou uma leitura antiga venceu.
+  Esperar parado (ex.: aguardando um respawn) não custa nenhuma mensagem ao
+  servidor.
+- **Perseguição com memória.** Se o caminho de uma perseguição esbarra numa
+  parede, o agente tenta flanquear antes de desistir, com cooldown para não
+  repetir a mesma tentativa fracassada contra a mesma parede.
 
 ## Requisitos
 
-- Python 3.10+.
-- Somente biblioteca padrao.
-- Servidor do desafio acessivel pela porta TCP `8888`.
+- Python 3.10+, apenas biblioteca padrão.
+- Acesso ao servidor do desafio pela porta TCP 8888.
 
-## Execucao
-
-Servidor de treino com nome aleatorio:
+## Execução
 
 ```bash
+# servidor de treino com nome aleatório
 python src/main.py
-```
 
-Host e nome especificos:
-
-```bash
+# host e nome específicos
 python src/main.py atari.icad.puc-rio.br MeuDrone
+
+# logs mais detalhados
+python src/main.py atari.icad.puc-rio.br MeuDrone --log-level debug
 ```
-
-Perfil agressivo:
-
-```bash
-python src/main.py atari.icad.puc-rio.br MeuDrone --aggressive
-```
-
-Perfis explicitos:
-
-```bash
-python src/main.py --profile score
-python src/main.py --profile aggressive
-python src/main.py --profile safe
-```
-
-Logs detalhados:
-
-```bash
-python src/main.py --log-level debug
-```
-
-## Perfis
-
-- `score`: perfil padrao, prioriza pontuacao, sobrevivencia e farming.
-- `aggressive`: aumenta tolerancia a confronto e distancia de ataque.
-- `safe`: reduz risco, foge mais cedo e e mais conservador em combate.
-
-`--aggressive` e mantido como alias de `--profile aggressive`.
 
 ## Testes
 
 ```bash
 python tests/test_offline.py
 python tests/simulation_compare.py
-python -m py_compile src\observations.py src\communication.py src\world_model.py src\risk.py src\planner.py src\farm.py src\combat.py src\strategy.py src\ai_agent.py src\devkit.py src\main.py
 ```
 
-A suite offline usa mocks e um servidor TCP local simulado. Ela nao depende do
-servidor externo.
+A suíte offline roda sem servidor externo: usa dublês (mocks) das
+respostas do servidor e um servidor TCP local simulado para os testes de
+ponta a ponta (coleta, poço, farming, timeout).
 
-## Comparacao Comportamental Local
+`tests/simulation_compare.py` compara, de forma determinística, a política
+econômica de comunicação atual com uma versão que sempre pede `q`+`o` a cada
+ciclo — útil para ver o tamanho real da economia de comandos sem depender de
+uma partida ao vivo.
 
-`tests/simulation_compare.py` compara a politica antiga, que fazia `q+o` em
-todo ciclo, com a politica atual. Resultado obtido localmente:
+## Limitações conhecidas
 
-| Cenario | Metrica | Antes | Depois |
-|---|---:|---:|---:|
-| Ambiente estavel | Comandos totais | 120 | 0 |
-| Ambiente estavel | Observacoes `o` | 60 | 0 |
-| Ambiente estavel | Consultas `q` | 60 | 0 |
-| Ambiente estavel | Pontuacao simulada | -120 | 0 |
-| `steps` sem inimigo | Tiros | 0 | 0 |
-| `steps` sem inimigo | Observacoes `o` | 8 | 4 |
-| Inimigo sem `hit` | Tiros | 4 | 4 |
-| Inimigo sem `hit` | Pontuacao simulada | -74 | -64 |
-| `CHASE` bloqueado | Transicoes `CHASE/HUNT` | 15 | 0 |
-| `CHASE` bloqueado | Reposicionamentos | 0 | 2 |
-
-As taxas por minuto nesse simulador rodam sem `sleep`, entao servem apenas
-para comparacao relativa entre antes/depois.
-
-## Limitacoes Conhecidas
-
-- O comportamento contra drones reais depende de latencia e dinamica do
+- O comportamento contra drones reais depende da latência e da dinâmica do
   servidor oficial; localmente foram validados protocolo, planejamento,
-  inferencia, farming, combate e FSM com simulacao.
-- O agente nao persiste mapas entre partidas, por seguranca. Persistir um mapa
-  especifico seria incorreto porque a posicao inicial e o mapa podem mudar.
-- Telemetria historica e chat automatico foram deixados fora do nucleo para
-  manter a solucao focada e testavel.
+  inferência, farming, combate e FSM com simulação, não com o servidor real.
+- O mapa e toda a memória aprendida são reiniciados a cada nova partida — o
+  labirinto pode ser outro, então nada é persistido entre partidas.

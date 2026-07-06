@@ -1,15 +1,23 @@
-"""TCP/IP protocol client for the INF1771 drone GameServer."""
+"""Cliente TCP/IP do GameServer: conecta, manda comandos e traduz as
+mensagens que chegam em estado consultável (posição, energia, placar...).
+
+Mensagens de `hit`/`damage` que chegam fora da resposta normal de uma
+observação (`notification`, ou os atalhos `h`/`d` que alguns servidores
+usam) ficam guardadas em `pending_observations` até a próxima observação
+real — sem isso, um acerto sofrido entre dois pedidos de observação seria
+perdido silenciosamente.
+"""
 
 import socket
 import threading
 import time
-from collections import Counter
 
 from observations import Observation, normalize_token, normalize_tokens, parse_observation_payload
 
 
 class HandleClient:
-    """Low-level TCP client with continuous receive thread."""
+    """Socket TCP cru: conecta, envia texto e mantém uma thread lendo o
+    que chega, repassando cada linha completa para quem se inscrever."""
 
     def __init__(self, log=print):
         self.sock = None
@@ -89,7 +97,8 @@ class HandleClient:
 
 
 class GameAI:
-    """Thread-safe GameServer protocol facade."""
+    """Estado atual da partida (posição, energia, placar, observações) e
+    os comandos do protocolo do enunciado, prontos para uso pelo agente."""
 
     DIRECTIONS = ("north", "east", "south", "west")
 
@@ -114,12 +123,9 @@ class GameAI:
         self.last_status_at = 0.0
         self.last_game_status_at = 0.0
         self.last_scoreboard_at = 0.0
-        self.command_counts = Counter()
-        self.total_commands = 0
 
         self.obs_event = threading.Event()
         self.status_event = threading.Event()
-        self.game_event = threading.Event()
         self.scoreboard_event = threading.Event()
         self.lock = threading.RLock()
 
@@ -138,37 +144,21 @@ class GameAI:
     def connected(self):
         return self.client.connected
 
-    def _send_command(self, msg):
-        ok = self.client.send_msg(msg)
-        if ok:
-            cmd = msg.split(";", 1)[0]
-            with self.lock:
-                self.command_counts[cmd] += 1
-                self.total_commands += 1
-        return ok
-
-    def command_metrics(self):
-        with self.lock:
-            return {
-                "total_commands": self.total_commands,
-                "commands": dict(self.command_counts),
-            }
-
-    def send_forward(self): return self._send_command("w")
-    def send_backward(self): return self._send_command("s")
-    def send_turn_left(self): return self._send_command("a")
-    def send_turn_right(self): return self._send_command("d")
-    def send_get_item(self): return self._send_command("t")
-    def send_shoot(self): return self._send_command("e")
-    def send_request_observation(self): return self._send_command("o")
-    def send_request_game_status(self): return self._send_command("g")
-    def send_request_user_status(self): return self._send_command("q")
-    def send_request_position(self): return self._send_command("p")
-    def send_request_scoreboard(self): return self._send_command("u")
-    def send_goodbye(self): return self._send_command("quit")
-    def send_name(self, name): return self._send_command(f"name;{name}")
-    def send_say(self, msg): return self._send_command(f"say;{msg}")
-    def send_color(self, r, g, b): return self._send_command(f"color;{r};{g};{b}")
+    def send_forward(self): return self.client.send_msg("w")
+    def send_backward(self): return self.client.send_msg("s")
+    def send_turn_left(self): return self.client.send_msg("a")
+    def send_turn_right(self): return self.client.send_msg("d")
+    def send_get_item(self): return self.client.send_msg("t")
+    def send_shoot(self): return self.client.send_msg("e")
+    def send_request_observation(self): return self.client.send_msg("o")
+    def send_request_game_status(self): return self.client.send_msg("g")
+    def send_request_user_status(self): return self.client.send_msg("q")
+    def send_request_position(self): return self.client.send_msg("p")
+    def send_request_scoreboard(self): return self.client.send_msg("u")
+    def send_goodbye(self): return self.client.send_msg("quit")
+    def send_name(self, name): return self.client.send_msg(f"name;{name}")
+    def send_say(self, msg): return self.client.send_msg(f"say;{msg}")
+    def send_color(self, r, g, b): return self.client.send_msg(f"color;{r};{g};{b}")
 
     def _remember_async_observation(self, obs_name):
         obs_name = normalize_token(obs_name)
@@ -232,7 +222,6 @@ class GameAI:
                     except ValueError:
                         pass
                 self.last_game_status_at = time.time()
-            self.game_event.set()
             return
         if head == "u":
             with self.lock:
@@ -252,12 +241,10 @@ class GameAI:
         if head in ("hello", "goodbye"):
             self.log(f"[SERVIDOR] {';'.join(cmd)}")
 
-    def has_pending_events(self):
-        with self.lock:
-            return bool(self.pending_observations)
-
     def consume_pending_events(self):
-        """Return async hit/damage events without sending a new observation command."""
+        """Retorna hit/damage assíncronos acumulados sem mandar 'o' novo —
+        usado pela política econômica de observação para não perder um
+        evento só porque ainda não era hora de reobservar."""
         with self.lock:
             events = list(self.pending_observations)
             self.pending_observations.clear()
@@ -292,16 +279,6 @@ class GameAI:
             return (self.player_x, self.player_y, self.player_dir,
                     self.player_state, self.score, self.energy)
 
-    def request_game_status_sync(self, timeout=0.5):
-        self.game_event.clear()
-        if not self.send_request_game_status():
-            return None
-        if not self.game_event.wait(timeout):
-            return None
-        with self.lock:
-            self.last_game_status_at = time.time()
-            return self.game_status, self.game_time
-
     def request_scoreboard_sync(self, timeout=0.5):
         self.scoreboard_event.clear()
         if not self.send_request_scoreboard():
@@ -313,6 +290,10 @@ class GameAI:
             return list(self.scoreboard)
 
     def request_sync_pair(self, timeout=0.5):
+        """Pede status e observação em paralelo (uma ida-e-volta em vez de
+        duas). Retorna None se qualquer uma das respostas não chegar a
+        tempo — o chamador nunca deve agir com dados só parcialmente
+        atualizados."""
         self.status_event.clear()
         self.obs_event.clear()
         status_sent = self.send_request_user_status()

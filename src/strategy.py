@@ -1,4 +1,11 @@
-"""Behavior-first finite-state controller for the drone agent."""
+"""A máquina de estados que decide o que o drone faz a cada tick.
+
+`DroneAgent` é o ponto de encontro de todo o resto: pergunta ao `WorldModel`
+o que já se sabe do mapa, ao `RiskModel` o quão perigosa está a vizinhança,
+ao `FarmManager` qual o melhor alvo de coleta e ao `CombatController` o que
+fazer com um inimigo por perto — e a partir disso escolhe um estado (EXPLORE,
+GRAB, ATTACK, FLEE...) e executa a ação correspondente.
+"""
 
 from collections import Counter
 from dataclasses import dataclass, field
@@ -24,41 +31,30 @@ from world_model import (
 TURN_LEFT_OF = {"north": "west", "west": "south", "south": "east", "east": "north"}
 TURN_RIGHT_OF = {"north": "east", "east": "south", "south": "west", "west": "north"}
 
-PROFILE_CONFIG = {
-    "score": {
-        "status_interval": 1.2,
-        "observation_min_interval": 0.45,
-        "observation_ttl": 3.0,
-        "enemy_ttl": 1.2,
-        "max_chase_ticks": 3,
-        "blocked_chase_cooldown": 6.0,
-        "max_blocked_chase_failures": 1,
-        "max_reposition_steps": 2,
-        "respawn_check_window": 0.8,
-    },
-    "aggressive": {
-        "status_interval": 0.8,
-        "observation_min_interval": 0.28,
-        "observation_ttl": 2.0,
-        "enemy_ttl": 1.5,
-        "max_chase_ticks": 6,
-        "blocked_chase_cooldown": 4.0,
-        "max_blocked_chase_failures": 2,
-        "max_reposition_steps": 3,
-        "respawn_check_window": 0.6,
-    },
-    "safe": {
-        "status_interval": 1.5,
-        "observation_min_interval": 0.6,
-        "observation_ttl": 2.5,
-        "enemy_ttl": 0.9,
-        "max_chase_ticks": 2,
-        "blocked_chase_cooldown": 8.0,
-        "max_blocked_chase_failures": 1,
-        "max_reposition_steps": 1,
-        "respawn_check_window": 1.0,
-    },
-}
+# Cadencia de comunicacao com o servidor: o quanto uma leitura de
+# status/observacao pode "envelhecer" antes de valer a pena pedir uma nova.
+# Depois de qualquer acao real (mover, girar, atirar, pegar) a proxima leitura
+# e sempre forcada, entao esses tempos so importam enquanto o agente segue um
+# plano ja tracado e nada relevante aconteceu.
+STATUS_INTERVAL = 1.2
+OBSERVATION_MIN_INTERVAL = 0.45
+OBSERVATION_TTL = 3.0
+
+# Por quanto tempo um inimigo visto continua contando como "ainda ali" para
+# fins de decisao (depois disso, considerado antigo e ignorado).
+ENEMY_TTL = 1.2
+
+# Perseguicao (CHASE): quantos ticks seguidos vale a pena insistir antes de
+# desistir e voltar a explorar/farmar, e o cooldown por posicao+bloqueio
+# quando o caminho da perseguicao esbarra numa parede.
+MAX_CHASE_TICKS = 3
+BLOCKED_CHASE_COOLDOWN = 6.0
+MAX_BLOCKED_CHASE_FAILURES = 1
+MAX_REPOSITION_STEPS = 2
+
+# Enquanto acampado esperando um respawn, so vale pedir observacao nova perto
+# da janela em que o item deve reaparecer (o resto do tempo, espera de graca).
+RESPAWN_CHECK_WINDOW = 0.8
 
 
 @dataclass
@@ -131,25 +127,22 @@ class AgentMetrics:
 
 
 class DroneAgent:
-    """Executable AI agent with economical observation policy."""
+    """Controla um drone: mantém o estado da partida (FSM) e decide, a cada
+    chamada de `act()`, qual ação enviar ao servidor."""
 
     STATES = {
         "EXPLORE", "GRAB", "RECHARGE", "ATTACK", "CHASE", "EVADE",
         "HUNT", "FLEE", "CAMP", "REPOSITION",
     }
 
-    def __init__(self, game_ai, log=print, profile="score", aggressive=False):
-        if aggressive:
-            profile = "aggressive"
+    def __init__(self, game_ai, log=print):
         self.ai = game_ai
         self.log = log
-        self.profile = profile
-        self.config = PROFILE_CONFIG.get(profile, PROFILE_CONFIG["score"])
         self.world = WorldModel()
         self.risk = RiskModel(self.world)
         self.planner = Planner(self.world, self.risk)
         self.farm = FarmManager(self.world, self.planner, self.risk, log=log)
-        self.combat = CombatController(self.world, self.risk, profile=profile, log=log)
+        self.combat = CombatController(self.world, self.risk, log=log)
 
         self.state = "EXPLORE"
         self.path = []
@@ -184,7 +177,8 @@ class DroneAgent:
         self._reposition_steps_left = 0
 
     def reset_for_new_game(self):
-        self.__init__(self.ai, log=self.log, profile=self.profile)
+        """Zera todo o conhecimento acumulado: o mapa pode ser outro."""
+        self.__init__(self.ai, log=self.log)
 
     def metrics_snapshot(self):
         score = getattr(self.ai, "score", None)
@@ -212,6 +206,14 @@ class DroneAgent:
         self._cached_view = (x, y, direction, pstate, score, energy, tokens)
 
     def sync(self):
+        """Garante uma leitura de status/observação para este tick, pedindo
+        ao servidor só o que realmente precisa de atualização.
+
+        Depois de qualquer ação real (mover, girar, atirar, pegar) a
+        próxima leitura é sempre forçada — nunca se decide com a posição de
+        antes da ação. Fora isso, uma leitura só é refeita quando "vence"
+        (STATUS_INTERVAL/OBSERVATION_TTL) ou quando nada mudou e dá para
+        continuar de graça (ex.: parado esperando um respawn)."""
         now = time.time()
         timeout = 0.45 + min(self.sync_fails * 0.18, 1.2)
 
@@ -238,9 +240,9 @@ class DroneAgent:
         }
         obs_due = (
             self._need_observation
-            and (urgent_obs or obs_age >= self.config["observation_min_interval"])
-        ) or obs_age >= self.config["observation_ttl"]
-        status_due = self._need_status or status_age >= self.config["status_interval"]
+            and (urgent_obs or obs_age >= OBSERVATION_MIN_INTERVAL)
+        ) or obs_age >= OBSERVATION_TTL
+        status_due = self._need_status or status_age >= STATUS_INTERVAL
 
         if status_due and obs_due:
             view = self.ai.request_sync_pair(timeout=timeout)
@@ -284,6 +286,10 @@ class DroneAgent:
     # ---------------- low-level actions ----------------
 
     def _set_state(self, new_state, reason=None):
+        """Muda de estado, logando a transição e cuidando dos efeitos
+        colaterais: salva o plano de farm/exploração em andamento antes de
+        entrar em combate (para retomar depois), descarta o caminho atual
+        ao sair de HUNT (que não usa `path`), e zera o contador de CHASE."""
         if new_state not in self.STATES:
             raise ValueError(f"estado desconhecido: {new_state}")
         if new_state != self.state:
@@ -302,6 +308,9 @@ class DroneAgent:
             self.state_entered_at = time.time()
 
     def _save_previous_plan(self):
+        """Guarda a rota de farm/exploração em andamento antes de entrar em
+        combate, para não perder um trajeto quase pronto por causa de um
+        desvio curto (ver `_restore_previous_plan`)."""
         if self._previous_plan is not None:
             return
         if self.path:
@@ -313,6 +322,8 @@ class DroneAgent:
             }
 
     def _restore_previous_plan(self):
+        """Retoma o plano salvo, se ainda for seguro (nada no caminho virou
+        bloqueio ou perigo enquanto o agente estava ocupado com o combate)."""
         if not self._previous_plan:
             return False
         path = list(self._previous_plan["path"])
@@ -349,6 +360,9 @@ class DroneAgent:
             self._fsm_history.pop(0)
 
     def _oscillating_chase_hunt(self):
+        """Detecta o padrão CHASE->HUNT->CHASE->HUNT preso na mesma posição
+        e bloqueio: sinal de que perseguir esse inimigo não está levando a
+        lugar nenhum e é hora de desistir."""
         recent = self._fsm_history[-4:]
         if len(recent) < 4:
             return False
@@ -407,6 +421,10 @@ class DroneAgent:
     # ---------------- perception and decision ----------------
 
     def _handle_blockage_and_motion(self, x, y, direction, observation):
+        """Atualiza o mapa a partir do que aconteceu com o último movimento:
+        impacto reportado pelo sensor, ou o drone tentou andar e não saiu
+        do lugar (comando perdido/ignorado — trava depois de 3 tentativas),
+        ou moveu mais de uma célula de uma vez (teleporte)."""
         if observation.blocked:
             bx, by = self._front_cell(x, y, direction)
             if in_bounds(bx, by):
@@ -443,6 +461,8 @@ class DroneAgent:
         self.last_pos = (x, y)
 
     def _looping(self):
+        """True se as últimas posições ficaram presas numa área pequena —
+        sinal de estar girando em círculo em vez de progredir."""
         recent = self.world.recent_positions
         if len(recent) < 24:
             return False
@@ -465,11 +485,17 @@ class DroneAgent:
             self._enemy_seen_distance = observation.enemy_distance
 
     def _enemy_fresh(self, observation):
+        """Um inimigo visível agora não conta se a última vez que foi
+        visto já passou de ENEMY_TTL — evita reagir a um alvo que já não
+        está mais lá."""
         if not observation.enemy:
             return False
-        return time.time() - self._enemy_seen_at <= self.config["enemy_ttl"]
+        return time.time() - self._enemy_seen_at <= ENEMY_TTL
 
     def _chase_key(self, x, y, direction, enemy_dist):
+        """Identifica a situação de perseguição (posição+direção+bloqueio
+        à frente+distância do inimigo), para não repetir a mesma tentativa
+        falha de avançar contra a mesma parede."""
         blocked = self._front_cell(x, y, direction)
         return ((x, y), direction, blocked, enemy_dist)
 
@@ -482,6 +508,9 @@ class DroneAgent:
         return False
 
     def _record_blocked_chase(self, x, y, direction, enemy_dist):
+        """Marca a célula à frente como bloqueada e aplica um cooldown
+        crescente para essa mesma situação de perseguição (mais falhas
+        seguidas = espera maior antes de tentar de novo)."""
         blocked = self._front_cell(x, y, direction)
         if in_bounds(*blocked):
             if self.world.grid[blocked[0]][blocked[1]] == BLOCKED:
@@ -491,7 +520,7 @@ class DroneAgent:
         key = self._chase_key(x, y, direction, enemy_dist)
         failures = self._blocked_chase_failures.get(key, 0) + 1
         self._blocked_chase_failures[key] = failures
-        cooldown = self.config["blocked_chase_cooldown"] * failures
+        cooldown = BLOCKED_CHASE_COOLDOWN * failures
         self._blocked_chase_cooldown[key] = time.time() + cooldown
         self.metrics.blocked_chase_failures += 1
         self.path = []
@@ -502,6 +531,10 @@ class DroneAgent:
         return failures
 
     def _combat_reposition_target(self, x, y, direction, observation):
+        """Escolhe uma célula vizinha para flanquear quando o CHASE trava:
+        prioriza os lados (esquerda/direita) sobre continuar no mesmo eixo,
+        células com mais saídas e menos visitadas, evitando as que já
+        falharam antes."""
         candidates = []
         preferred_dirs = self._left_right_dirs(direction)
         all_dirs = (*preferred_dirs, direction, TURN_LEFT_OF[TURN_LEFT_OF[direction]])
@@ -536,6 +569,8 @@ class DroneAgent:
         return candidates[0][1]
 
     def _abandon_chase(self, reason):
+        """Desiste de perseguir/caçar e volta a explorar — retomando o
+        plano de farm salvo antes do combate, se ainda for seguro."""
         self.metrics.chases_abandoned += 1
         self._enemy_seen_at = 0.0
         self._enemy_seen_distance = None
@@ -548,13 +583,17 @@ class DroneAgent:
             self._set_state("EXPLORE", reason)
 
     def decide_state(self, x, y, energy, observation):
+        """O coração da FSM: em que estado o drone deveria estar agora,
+        por ordem de prioridade — reagir a dano, recuperar energia crítica,
+        pegar item na célula atual, terminar um reposicionamento em
+        andamento, reagir a um inimigo visível e só então continuar o que
+        já estava fazendo (HUNT/CAMP em andamento) ou explorar/farmar."""
         pos = (x, y)
         now = time.time()
 
         if observation.damage:
-            # Contra-ataque: com energia e agressividade suficientes (perfil-
-            # dependente), combat.decide() retorna HUNT em vez de EVADE.
-            # Energia baixa e perfil 'safe' continuam sempre evadindo.
+            # Com energia e agressividade suficientes, combat.decide() manda
+            # contra-atacar (HUNT) em vez de só fugir; ver CombatController.decide.
             return self.combat.decide(energy, observation) or "EVADE"
         if energy <= LOW_ENERGY and self.farm.due_spots(("powerup",), energy):
             return "RECHARGE"
@@ -579,6 +618,10 @@ class DroneAgent:
         return "EXPLORE"
 
     def act(self):
+        """Um tick do agente: sincroniza com o servidor, atualiza tudo o
+        que foi aprendido (mapa, ameaça, combate, farm), decide o estado e
+        executa a ação correspondente. Chamado uma vez por iteração do
+        loop principal em main.py."""
         view = self.sync()
         if view is None:
             self.sync_fails += 1
@@ -630,6 +673,7 @@ class DroneAgent:
     # ---------------- state handlers ----------------
 
     def do_grab(self, x, y, direction, energy, observation, score):
+        """Pega o item da célula atual e volta a explorar."""
         self.ai.send_get_item()
         self._record_sent("t")
         self.last_action = "grab"
@@ -641,11 +685,11 @@ class DroneAgent:
         self._set_state("EXPLORE", "item coletado")
 
     def _clear_cached_light(self, pos):
-        """Remove o sinal de luz obsoleto do cache logo apos pegar o item:
-        sem isso, observe_respawn le a mesma observacao (ainda com a luz de
-        ANTES da coleta) nos proximos ticks ate a proxima resposta real do
-        servidor, e confunde 'ainda nao atualizou' com 'respawnou em <1s',
-        travando a estimativa de respawn no piso minimo."""
+        """Apaga a luz da observação em cache assim que o item é pego.
+
+        Sem isso, farm.observe_respawn ainda veria a luz de ANTES da coleta
+        nos próximos ticks (até a resposta real do servidor chegar) e
+        confundiria "ainda não atualizou" com "respawnou em menos de 1s"."""
         if self._cached_view is None:
             return
         vx, vy, direction, pstate, score, energy, tokens = self._cached_view
@@ -656,6 +700,7 @@ class DroneAgent:
         self._cached_view = (vx, vy, direction, pstate, score, energy, cleaned)
 
     def do_attack(self, x, y, direction, energy, observation, score):
+        """Atira se ainda compensar; senão recua para CHASE/EXPLORE."""
         enemy_dist = observation.enemy_distance
         if not self.combat.should_attack(energy, observation):
             self.log("[COMBATE] Tiro bloqueado por risco/custo/linha de fogo")
@@ -672,6 +717,8 @@ class DroneAgent:
             self._set_state("HUNT", "limite de tiros sem hit")
 
     def do_chase(self, x, y, direction, energy, observation, score):
+        """Fecha distância com o inimigo até abrir tiro. Se o caminho
+        travar, tenta flanquear (REPOSITION); sem saída, desiste."""
         self._chase_ticks += 1
         enemy_dist = observation.enemy_distance
         if not self._enemy_fresh(observation):
@@ -680,7 +727,7 @@ class DroneAgent:
         if self._chase_in_cooldown(x, y, direction, enemy_dist):
             self._set_state("REPOSITION", "cooldown de chase bloqueado")
             return
-        if self._chase_ticks > self.config["max_chase_ticks"]:
+        if self._chase_ticks > MAX_CHASE_TICKS:
             self._abandon_chase("limite economico de chase")
             return
         if self.combat.should_attack(energy, observation):
@@ -698,10 +745,7 @@ class DroneAgent:
             self.log(f"[COMBATE] CHASE avancando para {target}")
             return
         failures = self._record_blocked_chase(x, y, direction, enemy_dist)
-        if self.profile == "safe":
-            self._set_state("EVADE", "chase bloqueado repetido")
-            return
-        if failures > self.config["max_blocked_chase_failures"]:
+        if failures > MAX_BLOCKED_CHASE_FAILURES:
             self._abandon_chase("chase bloqueado repetido")
             return
         target = self._combat_reposition_target(x, y, direction, observation)
@@ -709,12 +753,14 @@ class DroneAgent:
             self.path = [target]
             self.goal = target
             self.path_allows_flash = False
-            self._reposition_steps_left = self.config["max_reposition_steps"]
+            self._reposition_steps_left = MAX_REPOSITION_STEPS
             self._set_state("REPOSITION", "chase bloqueado; reposicionando")
             return
         self._abandon_chase("chase bloqueado sem flanqueamento seguro")
 
     def do_reposition(self, x, y, direction, energy, observation, score):
+        """Anda até a célula de flanco escolhida por `_combat_reposition_target`
+        e tenta reabrir tiro; sem vantagem ao chegar, desiste do combate."""
         if self._oscillating_chase_hunt():
             self.metrics.fsm_oscillations += 1
             self._abandon_chase("oscilacao CHASE/HUNT detectada")
@@ -742,12 +788,11 @@ class DroneAgent:
         if not self.path:
             if self._enemy_fresh(observation) and self.combat.should_attack(energy, observation):
                 self._set_state("ATTACK", "reposicionamento abriu tiro")
-            elif self.profile == "aggressive" and self._enemy_fresh(observation):
-                self._set_state("HUNT", "reposicionamento concluido")
             else:
                 self._abandon_chase("reposicionamento concluido sem vantagem")
 
     def do_evade(self, x, y, direction, energy, observation, score):
+        """Sai da linha de tiro para a célula segura mais próxima."""
         if not self.path:
             target = self.combat.best_evade_cell(x, y, direction, observation)
             if target is None:
@@ -762,6 +807,8 @@ class DroneAgent:
             self._set_state("EXPLORE", "esquiva concluida")
 
     def do_hunt(self, x, y, direction, energy, observation, score):
+        """Gira procurando o inimigo que atirou (sem vê-lo). Se ele
+        aparecer na mira, decide entre ATTACK/CHASE/REPOSITION."""
         if self._oscillating_chase_hunt():
             self.metrics.fsm_oscillations += 1
             self._abandon_chase("oscilacao CHASE/HUNT detectada")
@@ -790,6 +837,8 @@ class DroneAgent:
             self._set_state("EXPLORE", "scan concluido")
 
     def do_flee(self, x, y, direction, energy, observation, score):
+        """Foge para a célula visitada mais bem pontuada por
+        `risk.flee_score` (longe da ameaça, com saídas, alcançável)."""
         if not self.path:
             visited = [
                 (cx, cy) for cx in range(59) for cy in range(34)
@@ -810,6 +859,7 @@ class DroneAgent:
         self._follow_path(x, y, direction)
 
     def do_recharge(self, x, y, direction, energy, observation, score):
+        """Vai até o powerup conhecido mais próximo."""
         if not self.path:
             powerups = [p for p in self.farm.due_spots(("powerup",), energy=0) if p != (x, y)]
             goal, path = self.planner.nearest_reachable((x, y), powerups)
@@ -824,6 +874,9 @@ class DroneAgent:
         self._follow_path(x, y, direction)
 
     def do_camp(self, x, y, direction, energy, observation, score):
+        """Espera parado sobre um ponto de item maduro até o respawn
+        (de graça: só pede observação perto da janela esperada). Sai
+        se surgir algo melhor, se demorar demais ou se entrar em loop."""
         if observation.has_item:
             self._set_state("GRAB", "respawn no camp")
             self.do_grab(x, y, direction, energy, observation, score)
@@ -836,7 +889,7 @@ class DroneAgent:
                 self._set_state("EXPLORE", "ponto sem luz atual; adiando nova checagem")
                 return
         next_check = self.farm.next_check_at((x, y), now)
-        if next_check is not None and now >= next_check - self.config["respawn_check_window"]:
+        if next_check is not None and now >= next_check - RESPAWN_CHECK_WINDOW:
             self._request_observation_next()
         if self.farm.has_better_reachable_plan((x, y), direction, energy):
             self._set_state("EXPLORE", "alvo melhor que camp")
@@ -854,6 +907,8 @@ class DroneAgent:
             self._last_camp_log_at = now
 
     def do_explore(self, x, y, direction, energy, observation, score):
+        """Segue o plano de farm/exploração atual, ou escolhe um novo
+        via `farm.choose_plan` quando não há nenhum em andamento."""
         if self.path and not observation.damage:
             self.metrics.plan_reused += 1
             self._follow_path(x, y, direction)
@@ -889,6 +944,9 @@ class DroneAgent:
         self._follow_path(x, y, direction)
 
     def _idle_or_probe(self, x, y):
+        """Sem nenhum alvo alcançável, fica parado (esperar é de graça).
+        Se o impasse durar demais, arrisca a célula desconhecida de menor
+        risco lógico para tentar destravar o mapa."""
         now = time.time()
         if self.idle_since is None:
             self.idle_since = now
@@ -908,6 +966,9 @@ class DroneAgent:
                     self.log(f"[PLANO] Impasse: sondando {best}")
 
     def _follow_path(self, x, y, direction):
+        """Dá um passo no `self.path` atual, replanejando se a próxima
+        célula ficou bloqueada/perigosa ou deixou de ser adjacente (ex.:
+        depois de um teleporte)."""
         if not self.path:
             self.last_action = "wait"
             self.last_target = None

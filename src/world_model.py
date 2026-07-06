@@ -1,4 +1,15 @@
-"""Incremental 59x34 world model for the drone challenge."""
+"""O que o drone sabe sobre o labirinto 59x34, construído aos poucos.
+
+O agente não recebe o mapa pronto — cada célula começa `UNKNOWN` e só é
+classificada a partir do que os sensores dizem na célula em que o drone está
+agora. `breeze`/`flash` funcionam como no Mundo de Wumpus: indicam que HÁ um
+poço/teleporte em algum vizinho, sem dizer qual — por eliminação (todo
+vizinho sem evidência contrária é descartado), quando sobra um único
+candidato ele vira poço/teleporte CONFIRMADO.
+
+Esse conhecimento também alimenta o planejamento de rota (A*/BFS aqui
+dentro): célula suspeita de poço nunca é considerada andável.
+"""
 
 import heapq
 from collections import deque
@@ -48,10 +59,15 @@ def turn_cost(current_dir, target_dir):
 
 
 class WorldModel:
+    """Mapa conhecido, memória de itens/ameaças e as buscas (A*/BFS) que
+    andam sobre esse mapa. `version` sobe a cada mudança real na grade, e é
+    o que o `Planner` usa para saber quando um caminho em cache ficou velho."""
+
     def __init__(self):
         self.reset()
 
     def reset(self):
+        """Esquece o mapa inteiro (nova partida: pode ser outro labirinto)."""
         self.grid = [[UNKNOWN] * HEIGHT for _ in range(WIDTH)]
         self.breeze_cells = set()
         self.flash_cells = set()
@@ -115,6 +131,9 @@ class WorldModel:
         return x + dx, y + dy
 
     def update_from_observation(self, x, y, obs):
+        """Incorpora o que os sensores disseram na célula (x, y): marca a
+        célula como visitada, registra breeze/flash e o item no chão, e
+        reclassifica o resto do mapa com o conhecimento novo."""
         observation = obs if isinstance(obs, Observation) else Observation.from_tokens(obs)
         self.update_pose(x, y, self.orientation)
         self.mark_visited(x, y)
@@ -139,6 +158,9 @@ class WorldModel:
         self._reinfer()
 
     def _reinfer(self):
+        """Reclassifica toda célula ainda não visitada, à luz de todo
+        breeze/flash já sentido: resolução por eliminação (ver docstring do
+        módulo) confirma poço/teleporte quando só sobra um candidato."""
         old_version = self.version
         suspects_pit = set()
         for bx, by in self.breeze_cells:
@@ -182,6 +204,9 @@ class WorldModel:
             self._changed()
 
     def pit_risk(self, x, y):
+        """0 se comprovadamente seguro, 99 se poço confirmado, ou a
+        contagem de brisas adjacentes testemunhando contra a célula (usado
+        para comparar risco quando não há alternativa totalmente segura)."""
         if (x, y) in self.no_pit:
             return 0
         if (x, y) in self.confirmed_pits:
@@ -199,6 +224,8 @@ class WorldModel:
         return self.pit_risk(x, y) * 100 + self.teleport_risk(x, y) * 10
 
     def safe_exit_count(self, x, y):
+        """Quantos vizinhos parecem utilizáveis sem risco fatal — usado
+        para não escolher becos sem saída como destino de fuga."""
         return sum(
             1 for nx, ny in neighbors(x, y)
             if self.grid[nx][ny] in (SAFE, VISITED, UNKNOWN, DANGER_FLASH)
@@ -228,6 +255,8 @@ class WorldModel:
         return self.is_walkable(x, y, allow_unknown=allow_unknown, allow_flash=allow_flash)
 
     def frontier_cells(self):
+        """Células seguras/desconhecidas vizinhas de algo já visitado — os
+        candidatos naturais para continuar explorando o mapa."""
         frontier = []
         for x in range(WIDTH):
             for y in range(HEIGHT):
@@ -238,6 +267,9 @@ class WorldModel:
         return frontier
 
     def reachable_map(self, start, allow_flash=False, allow_unknown=True):
+        """BFS a partir de `start`: distância e "de onde veio" para toda
+        célula alcançável, numa única varredura (mais barato que rodar A*
+        alvo por alvo quando é preciso ranquear vários candidatos)."""
         dist = {start: 0}
         parent = {start: None}
         queue = deque([start])
@@ -263,6 +295,8 @@ class WorldModel:
         return path
 
     def nearest_reachable(self, start, goals, allow_flash=False):
+        """Entre `goals`, o mais próximo que dá para alcançar de fato
+        (numa única varredura, em vez de testar alvo por alvo)."""
         goals = set(goals) - {start}
         if not goals:
             return None, None
@@ -274,6 +308,8 @@ class WorldModel:
         return goal, self.path_from_parent(parent, goal)
 
     def farthest_reachable(self, start, goals, score_fn=None, allow_flash=False):
+        """Como `nearest_reachable`, mas pega o alvo com maior `score_fn`
+        (por padrão, o mais distante) — para fuga, por exemplo."""
         goals = set(goals) - {start}
         if not goals:
             return None, None
@@ -289,6 +325,11 @@ class WorldModel:
 
     def a_star(self, start, goal, allow_unknown=False, start_dir=None,
                allow_flash=False, extra_cost=None):
+        """Caminho mais curto até `goal`, contando giros como custo (cada
+        90° vira +1 na busca) e nunca passando por célula suspeita de poço.
+        `allow_flash` permite atravessar suspeita de teleporte (só como
+        último recurso: teleporte não mata, poço sim). `extra_cost(cell)`,
+        se passado, soma um custo de risco por célula do caminho."""
         if start == goal:
             return []
         if goal != start and not self.can_enter(*goal, allow_unknown=allow_unknown,

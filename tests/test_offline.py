@@ -250,8 +250,8 @@ class MiniServer(threading.Thread):
 
 
 def test_smoke_agent():
-    from devkit import GameAI
-    from ai_agent import DroneAgent
+    from communication import GameAI
+    from strategy import DroneAgent
 
     random.seed(42)
     port = random.randint(20000, 30000)
@@ -279,8 +279,8 @@ def test_smoke_agent():
 def test_pit_avoidance():
     """Sala fechada com um poco: o agente deve explorar, pegar o tesouro
     e NUNCA cair no poco, mesmo passando perto dele."""
-    from devkit import GameAI
-    from ai_agent import DroneAgent
+    from communication import GameAI
+    from strategy import DroneAgent
 
     random.seed(7)
     port = random.randint(20000, 30000)
@@ -311,8 +311,8 @@ def test_stale_data_discarded():
     """Propriedade de seguranca: (1) sync retorna None quando a resposta
     nao chega no timeout (nunca entrega dados velhos); (2) um tick com
     sync None nao executa acao nem altera o modelo de mundo."""
-    from devkit import GameAI
-    from ai_agent import DroneAgent
+    from communication import GameAI
+    from strategy import DroneAgent
     from world_model import UNKNOWN
 
     random.seed(11)
@@ -470,13 +470,13 @@ def test_farming_avoids_recent_danger_zone():
 
 
 def test_combat_rules():
-    from combat import CombatController
+    from combat import CombatController, FIRST_ENGAGEMENT_MISS_LIMIT
     from observations import Observation
     from risk import RiskModel
 
     w = WorldModel()
     risk = RiskModel(w)
-    combat = CombatController(w, risk, profile="score", log=lambda m: None)
+    combat = CombatController(w, risk, log=lambda m: None)
     for y in range(2, 6):
         w.update_from_observation(5, y, [])
     w.update_pose(5, 5, "north")
@@ -488,7 +488,7 @@ def test_combat_rules():
     assert combat.decide(20, Observation.from_tokens(["enemy#3"])) == "EVADE"
     # energia baixa: sempre evade ao levar dano, mesmo com agressividade alta
     assert combat.decide(20, Observation.from_tokens(["damage"])) == "EVADE"
-    # energia/agressividade suficientes (perfil score): contra-ataca em vez de so fugir
+    # energia/agressividade suficientes: contra-ataca em vez de so fugir
     assert combat.decide(60, Observation.from_tokens(["damage"])) == "HUNT"
     assert combat.hunt_reason == "damage"
     combat.record_shot()
@@ -496,12 +496,14 @@ def test_combat_rules():
     assert combat.shots_hit == 1 and combat.shots_since_hit == 0
     combat.shots_since_hit = combat.miss_limit(6)
     assert combat.after_miss_limit(6)
-    aggressive = CombatController(w, risk, profile="aggressive", log=lambda m: None)
-    aggressive.shots_fired = aggressive.initial_miss_limit
-    aggressive.shots_hit = 0
+
+    # varios tiros seguidos sem NENHUM acerto: desengaja e pausa o combate
+    unlucky = CombatController(w, risk, log=lambda m: None)
+    unlucky.shots_fired = FIRST_ENGAGEMENT_MISS_LIMIT
+    unlucky.shots_hit = 0
     w.grid[5][4] = VISITED
-    assert not aggressive.should_attack(100, Observation.from_tokens(["enemy#3"]))
-    assert aggressive.engage_pause_until > time.time()
+    assert not unlucky.should_attack(100, Observation.from_tokens(["enemy#3"]))
+    assert unlucky.engage_pause_until > time.time()
     print("OK: combat (linha de tiro, steps, hit, miss limit, evade/chase)")
 
 
@@ -563,45 +565,34 @@ class FakeAI:
     def send_shoot(self): self.actions.append("e")
 
 
-def test_strategy_fsm_profiles_and_reset():
+def test_strategy_fsm_and_reset():
     from strategy import DroneAgent
 
     ai = FakeAI([(5, 5, "north", "game", 0, 60, ["blueLight"])])
-    agent = DroneAgent(ai, log=lambda m: None, profile="score")
+    agent = DroneAgent(ai, log=lambda m: None)
     agent.act()
     assert "t" in ai.actions and agent.state == "EXPLORE"
 
     ai2 = FakeAI([(5, 5, "north", "game", 0, 20, ["damage"])])
-    agent2 = DroneAgent(ai2, log=lambda m: None, profile="safe")
+    agent2 = DroneAgent(ai2, log=lambda m: None)
     agent2.world.update_from_observation(5, 5, [])
     agent2.world.update_from_observation(6, 5, [])
     agent2.act()
     assert agent2.state in ("EVADE", "FLEE", "EXPLORE")
-    assert agent2.profile == "safe"
 
-    ai3 = FakeAI([])
-    agent3 = DroneAgent(ai3, log=lambda m: None, aggressive=True)
-    assert agent3.profile == "aggressive"
+    agent3 = DroneAgent(FakeAI([]), log=lambda m: None)
     agent3.world.update_from_observation(1, 1, [])
     assert agent3.world.visit_count
     agent3.reset_for_new_game()
     assert not agent3.world.visit_count and agent3.state == "EXPLORE"
-    print("OK: strategy (FSM, perfis, reset completo)")
-
-
-def test_aggressive_typo_alias():
-    from main import parse_args
-
-    args = parse_args(["--aggresive"])
-    assert args.aggressive
-    print("OK: main (--aggresive aceito como alias)")
+    print("OK: strategy (FSM e reset completo)")
 
 
 def test_economical_observation_policy():
     from strategy import DroneAgent
 
     ai = FakeAI([(5, 5, "north", "game", 0, 100, [])])
-    agent = DroneAgent(ai, log=lambda m: None, profile="score")
+    agent = DroneAgent(ai, log=lambda m: None)
     agent.act()
     ai.actions.clear()
 
@@ -627,7 +618,7 @@ def test_observe_after_movement_not_each_idle_tick():
     from strategy import DroneAgent
 
     ai = FakeAI([])
-    agent = DroneAgent(ai, log=lambda m: None, profile="score")
+    agent = DroneAgent(ai, log=lambda m: None)
     agent._cached_view = (5, 5, "north", "game", 0, 100, [])
     agent._last_status_at = time.time()
     agent._last_observation_at = time.time()
@@ -648,7 +639,7 @@ def test_steps_do_not_cancel_safe_route_or_shoot():
     from strategy import DroneAgent
 
     ai = FakeAI([])
-    agent = DroneAgent(ai, log=lambda m: None, profile="score")
+    agent = DroneAgent(ai, log=lambda m: None)
     agent._cached_view = (5, 5, "north", "game", 0, 100, ["steps"])
     agent._last_status_at = time.time()
     agent._last_observation_at = time.time()
@@ -665,34 +656,11 @@ def test_steps_do_not_cancel_safe_route_or_shoot():
     print("OK: steps isolado nao atira nem cancela rota segura")
 
 
-def test_aggressive_idle_does_not_poll_faster_without_enemy():
-    from strategy import DroneAgent
-
-    ai = FakeAI([(5, 5, "north", "game", 0, 100, [])])
-    agent = DroneAgent(ai, log=lambda m: None, profile="aggressive")
-    agent.act()
-    ai.actions.clear()
-    agent.world.item_spots[(5, 5)] = "treasure"
-    agent.farm.last_taken[(5, 5)] = time.time()
-    agent.farm.spot_respawn[(5, 5)] = 30.0
-    agent.farm.spot_next_check[(5, 5)] = time.time() + 30.0
-    agent.state = "CAMP"
-    agent.farm.has_better_reachable_plan = lambda *args, **kwargs: False
-    agent._need_status = False
-    agent._need_observation = False
-    agent._last_status_at = time.time()
-    agent._last_observation_at = time.time()
-    for _ in range(20):
-        agent.act()
-    assert ai.actions.count("o") == 0 and ai.actions.count("q") == 0, ai.actions
-    print("OK: aggressive ocioso nao aumenta consultas sem inimigo")
-
-
 def test_camp_without_current_light_is_deferred():
     from strategy import DroneAgent
 
     ai = FakeAI([])
-    agent = DroneAgent(ai, log=lambda m: None, profile="score")
+    agent = DroneAgent(ai, log=lambda m: None)
     agent._cached_view = (6, 12, "north", "game", 0, 100, [])
     agent._last_status_at = time.time()
     agent._last_observation_at = time.time()
@@ -713,11 +681,11 @@ def test_camp_without_current_light_is_deferred():
     print("OK: camp sem luz atual e adiado para evitar loop estatico")
 
 
-def prepare_blocked_chase_agent(profile="score", obs=None):
+def prepare_blocked_chase_agent(obs=None):
     from strategy import DroneAgent
 
     ai = FakeAI([])
-    agent = DroneAgent(ai, log=lambda m: None, profile=profile)
+    agent = DroneAgent(ai, log=lambda m: None)
     tokens = obs if obs is not None else ["enemy#6"]
     agent._cached_view = (26, 23, "east", "game", 0, 100, tokens)
     agent._last_status_at = time.time()
@@ -736,7 +704,7 @@ def prepare_blocked_chase_agent(profile="score", obs=None):
 
 
 def test_blocked_chase_does_not_oscillate_hunt_chase():
-    agent, ai = prepare_blocked_chase_agent("score")
+    agent, ai = prepare_blocked_chase_agent()
     for _ in range(8):
         agent.act()
     snap = agent.metrics_snapshot()
@@ -749,7 +717,7 @@ def test_blocked_chase_does_not_oscillate_hunt_chase():
 
 
 def test_repeated_blocked_chase_adds_cooldown_and_changes_strategy():
-    agent, ai = prepare_blocked_chase_agent("score")
+    agent, ai = prepare_blocked_chase_agent()
     agent.act()
     first = agent.metrics_snapshot()["blocked_chase_failures"]
     agent._set_state("CHASE", "teste repeticao")
@@ -763,7 +731,7 @@ def test_repeated_blocked_chase_adds_cooldown_and_changes_strategy():
 
 
 def test_stale_enemy_observation_does_not_reactivate_chase():
-    agent, ai = prepare_blocked_chase_agent("score")
+    agent, ai = prepare_blocked_chase_agent()
     agent._enemy_seen_at = time.time() - 10
     agent.act()
     assert agent.state != "CHASE"
@@ -772,7 +740,7 @@ def test_stale_enemy_observation_does_not_reactivate_chase():
 
 
 def test_blocked_chase_repositions_laterally_when_safe():
-    agent, ai = prepare_blocked_chase_agent("aggressive")
+    agent, ai = prepare_blocked_chase_agent()
     agent.act()
     assert agent.state in ("REPOSITION", "HUNT", "EXPLORE", "ATTACK")
     for _ in range(3):
@@ -783,19 +751,24 @@ def test_blocked_chase_repositions_laterally_when_safe():
 
 
 def test_blocked_chase_without_flank_evades_or_abandons():
-    agent, ai = prepare_blocked_chase_agent("safe")
+    agent, ai = prepare_blocked_chase_agent()
+    # bloqueia as 3 direcoes alcancaveis (frente ja esta bloqueada pelo
+    # setup): sem flanco em lugar nenhum, so resta abandonar a perseguicao.
     agent.world.mark_blocked(26, 22)
     agent.world.mark_blocked(26, 24)
+    agent.world.mark_blocked(25, 23)
     agent.act()
     for _ in range(3):
         agent.act()
-    assert agent.state in ("EVADE", "FLEE", "EXPLORE", "REPOSITION")
+    assert agent.state in ("EVADE", "FLEE", "EXPLORE")
     assert agent.metrics_snapshot()["transitions"].get("HUNT->CHASE", 0) == 0
     print("OK: sem flanqueamento, abandona/foge em vez de hunt infinito")
 
 
 def test_failed_chase_restores_previous_farm_plan():
-    agent, ai = prepare_blocked_chase_agent("score")
+    import strategy
+
+    agent, ai = prepare_blocked_chase_agent()
     agent.world.update_from_observation(25, 23, [])
     agent._previous_plan = {
         "goal": (25, 23),
@@ -803,8 +776,12 @@ def test_failed_chase_restores_previous_farm_plan():
         "allows_flash": False,
         "saved_at": time.time(),
     }
-    agent.config["max_blocked_chase_failures"] = 0
-    agent.act()
+    original_limit = strategy.MAX_BLOCKED_CHASE_FAILURES
+    strategy.MAX_BLOCKED_CHASE_FAILURES = 0
+    try:
+        agent.act()
+    finally:
+        strategy.MAX_BLOCKED_CHASE_FAILURES = original_limit
     assert agent.goal == (25, 23) or agent.metrics_snapshot()["previous_plan_restored"] >= 1
     assert agent.state == "EXPLORE"
     print("OK: chase falho pode restaurar plano de farm/exploracao anterior")
@@ -814,8 +791,8 @@ def test_farming():
     """Itens reaparecem: numa sala minuscula ja explorada, o agente deve
     ACAMPAR sobre o ponto de tesouro e coleta-lo a cada respawn,
     multiplicando a pontuacao."""
-    from devkit import GameAI
-    from ai_agent import DroneAgent
+    from communication import GameAI
+    from strategy import DroneAgent
 
     random.seed(5)
     port = random.randint(20000, 30000)
@@ -847,13 +824,10 @@ def test_farming():
 
 
 def test_damage_reaction_hunts_when_strong_evades_when_weak():
-    """Regressao: combat.decide() setava hunt_reason='damage' mas sempre
-    retornava EVADE (o HUNT nunca era alcancado), e strategy.decide_state()
-    tinha seu PROPRIO 'if observation.damage: return EVADE' incondicional,
-    que nem chegava a chamar combat.decide(). Os dois pontos foram
-    corrigidos: agora perfis com energia/agressividade suficientes reagem a
-    dano com HUNT (contra-ataque); energia baixa e o perfil 'safe' (limiar
-    de agressividade mais alto) continuam evadindo."""
+    """Ao levar tiro, o agente contra-ataca (HUNT) quando tem energia e
+    agressividade suficientes, e evade quando esta fraco. decide_state()
+    delega essa escolha inteira a combat.decide() -- nao ha atalho que
+    sempre force fuga, como havia antes dessa reacao ser corrigida."""
     from combat import CombatController
     from observations import Observation
     from risk import RiskModel
@@ -861,44 +835,23 @@ def test_damage_reaction_hunts_when_strong_evades_when_weak():
 
     w = WorldModel()
     risk = RiskModel(w)
+    combat = CombatController(w, risk, log=lambda m: None)
     dmg = Observation.from_tokens(["damage"])
 
-    # energia moderada/alta e agressividade suficiente -> HUNT, por perfil
-    score = CombatController(w, risk, profile="score", log=lambda m: None)
-    assert score.decide(60, dmg) == "HUNT" and score.hunt_reason == "damage"
+    assert combat.decide(60, dmg) == "HUNT" and combat.hunt_reason == "damage"
+    assert combat.decide(20, dmg) == "EVADE"  # energia baixa: sempre evade
 
-    aggressive = CombatController(w, risk, profile="aggressive", log=lambda m: None)
-    assert aggressive.decide(60, dmg) == "HUNT" and aggressive.hunt_reason == "damage"
-
-    safe = CombatController(w, risk, profile="safe", log=lambda m: None)
-    # mesma energia/distancia assumida, mas o limiar de agressividade do
-    # perfil 'safe' e mais alto: continua evadindo em vez de contra-atacar
-    assert safe.decide(60, dmg) == "EVADE"
-
-    # energia baixa: SEMPRE evade, independente do perfil
-    for profile in ("score", "aggressive", "safe"):
-        combat = CombatController(w, risk, profile=profile, log=lambda m: None)
-        assert combat.decide(20, dmg) == "EVADE", f"perfil {profile} deveria evadir com energia baixa"
-
-    # verificacao fim-a-fim: strategy.decide_state precisa REALMENTE chamar
-    # combat.decide() para o caso de dano (o bug antigo tinha um segundo
-    # atalho hardcoded em strategy.py que nunca deixava isso acontecer)
     ai = FakeAI([(5, 5, "north", "game", 0, 60, ["damage"])])
-    agent = DroneAgent(ai, log=lambda m: None, profile="aggressive")
+    agent = DroneAgent(ai, log=lambda m: None)
     agent.act()
     assert agent.state == "HUNT", f"esperado HUNT, obtido {agent.state}"
 
-    ai_safe = FakeAI([(5, 5, "north", "game", 0, 60, ["damage"])])
-    agent_safe = DroneAgent(ai_safe, log=lambda m: None, profile="safe")
-    agent_safe.act()
-    assert agent_safe.state == "EVADE", f"esperado EVADE, obtido {agent_safe.state}"
-
     ai_low = FakeAI([(5, 5, "north", "game", 0, 15, ["damage"])])
-    agent_low = DroneAgent(ai_low, log=lambda m: None, profile="aggressive")
+    agent_low = DroneAgent(ai_low, log=lambda m: None)
     agent_low.act()
     assert agent_low.state == "EVADE", f"energia critica deveria evadir, obtido {agent_low.state}"
 
-    print("OK: reacao a damage (HUNT quando forte, EVADE quando fraco/energia baixa/perfil safe)")
+    print("OK: reacao a damage (HUNT quando forte, EVADE quando fraco/energia baixa)")
 
 
 def test_survey_state_removed():
@@ -927,7 +880,7 @@ def test_no_stale_observation_reuse_after_critical_actions():
 
     # 1) apos GRAB: observacao fresca exigida e luz obsoleta removida do cache
     ai = FakeAI([(5, 5, "north", "game", 0, 100, ["blueLight"])])
-    agent = DroneAgent(ai, log=lambda m: None, profile="score")
+    agent = DroneAgent(ai, log=lambda m: None)
     agent.act()
     assert agent.last_action == "grab"
     assert agent._need_observation is True, "GRAB deve forcar reobservacao no proximo tick"
@@ -937,7 +890,7 @@ def test_no_stale_observation_reuse_after_critical_actions():
 
     # 2) apos SHOOT: observacao fresca exigida para saber se houve 'hit'
     ai2 = FakeAI([(5, 5, "north", "game", 0, 100, ["enemy#2"])])
-    agent2 = DroneAgent(ai2, log=lambda m: None, profile="aggressive")
+    agent2 = DroneAgent(ai2, log=lambda m: None)
     agent2.world.update_from_observation(5, 5, [])
     agent2.act()
     assert agent2.last_action == "shoot", f"esperado tiro, obtido {agent2.last_action}"
@@ -945,7 +898,7 @@ def test_no_stale_observation_reuse_after_critical_actions():
 
     # 3) apos 'blocked': mapa/rota precisam ser recalculados com dado fresco
     ai3 = FakeAI([(5, 5, "north", "game", 0, 100, ["blocked"])])
-    agent3 = DroneAgent(ai3, log=lambda m: None, profile="score")
+    agent3 = DroneAgent(ai3, log=lambda m: None)
     agent3.path = [(5, 4)]
     agent3.act()
     assert agent3._need_observation is True, "'blocked' deve forcar reobservacao"
@@ -953,7 +906,7 @@ def test_no_stale_observation_reuse_after_critical_actions():
     # 4) apos mudanca de celula (forward bem-sucedido): o tick seguinte nao
     # deve decidir com o status/observacao antigos da celula anterior
     ai4 = FakeAI([])
-    agent4 = DroneAgent(ai4, log=lambda m: None, profile="score")
+    agent4 = DroneAgent(ai4, log=lambda m: None)
     agent4._cached_view = (5, 5, "north", "game", 0, 100, [])
     agent4._last_status_at = time.time()
     agent4._last_observation_at = time.time()
@@ -1017,7 +970,7 @@ def test_player_state_reset_on_new_game():
     created_agents = []
 
     class FakeAgent:
-        def __init__(self, ai, log=print, profile="score"):
+        def __init__(self, ai, log=print):
             self.ai = ai
             self.state = "EXPLORE"
             self.config = {}
@@ -1067,13 +1020,11 @@ if __name__ == "__main__":
     test_damage_reaction_hunts_when_strong_evades_when_weak()
     test_survey_state_removed()
     test_no_stale_observation_reuse_after_critical_actions()
-    test_strategy_fsm_profiles_and_reset()
-    test_aggressive_typo_alias()
+    test_strategy_fsm_and_reset()
     test_player_state_reset_on_new_game()
     test_economical_observation_policy()
     test_observe_after_movement_not_each_idle_tick()
     test_steps_do_not_cancel_safe_route_or_shoot()
-    test_aggressive_idle_does_not_poll_faster_without_enemy()
     test_camp_without_current_light_is_deferred()
     test_blocked_chase_does_not_oscillate_hunt_chase()
     test_repeated_blocked_chase_adds_cooldown_and_changes_strategy()

@@ -164,7 +164,7 @@ def summarize(ai, agent):
 
 def run_stable(agent_cls):
     ai = SimAI([])
-    agent = agent_cls(ai, log=lambda m: None, profile="score")
+    agent = agent_cls(ai, log=lambda m: None)
     setup_camp(agent, ai)
     ai.actions.clear()
     ai.score = 0
@@ -175,7 +175,7 @@ def run_stable(agent_cls):
 
 def run_steps_route(agent_cls):
     ai = SimAI(["steps"])
-    agent = agent_cls(ai, log=lambda m: None, profile="score")
+    agent = agent_cls(ai, log=lambda m: None)
     agent._cached_view = (5, 5, "north", "game", 0, 100, ["steps"])
     agent._last_status_at = time.time()
     agent._last_observation_at = time.time()
@@ -191,7 +191,7 @@ def run_steps_route(agent_cls):
 
 def run_enemy_no_hit(agent_cls):
     ai = SimAI(["enemy#3"])
-    agent = agent_cls(ai, log=lambda m: None, profile="aggressive")
+    agent = agent_cls(ai, log=lambda m: None)
     agent._cached_view = (5, 5, "north", "game", 0, 100, ["enemy#3"])
     agent._last_status_at = time.time()
     agent._last_observation_at = time.time()
@@ -223,7 +223,7 @@ def setup_blocked_chase(agent, ai):
 
 def run_blocked_chase(agent_cls):
     ai = SimAI(["enemy#6"])
-    agent = agent_cls(ai, log=lambda m: None, profile="score")
+    agent = agent_cls(ai, log=lambda m: None)
     setup_blocked_chase(agent, ai)
     for _ in range(8):
         agent.act()
