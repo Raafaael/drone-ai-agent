@@ -427,6 +427,48 @@ def test_farming_utility_and_pending_grabs():
     print("OK: farm (utilidade economica, pending_grabs, valor aprendido)")
 
 
+def test_farming_avoids_recent_danger_zone():
+    """Regressao/melhoria: a escolha de alvo de farm/exploracao quase nao
+    levava risco recente em conta -- o desconto era FIXO (no maximo ~3.5 de
+    uma ameaca recente de ate 70), irrelevante frente a farm_utility() (valor
+    por segundo), que cresce muito rapido para alvos proximos: um alvo so 1-2
+    passos mais perto ja vale centenas de pontos a mais, o que nenhum
+    desconto fixo supera. Por isso o agente farmava de volta bem perto de
+    onde acabou de ser atacado. O desconto agora e proporcional ao valor do
+    proprio alvo (corta uma fracao dele), entao uma ameaca forte e recente
+    consegue de fato virar a escolha mesmo quando o alvo perigoso e mais
+    perto. Sobrevivencia importa em toda partida (o enunciado encerra a
+    partida do agente ao morrer, nao so desconta -10 pontos)."""
+    from farm import FarmManager
+    from planner import Planner
+    from risk import RiskModel
+    from observations import Observation
+
+    w = WorldModel()
+    risk = RiskModel(w)
+    planner = Planner(w, risk)
+    farm = FarmManager(w, planner, risk, log=lambda m: None)
+
+    start = (10, 10)
+    spot_risky = (10, 7)   # 3 passos: mais perto, mas onde o agente acabou
+                           # de levar tiro
+    spot_safe = (10, 5)    # 5 passos: mais longe, sem ameaca recente
+
+    w.mark_visited(*start)
+    for y in range(4, 10):
+        w.mark_safe(10, y)
+    w.item_spots[spot_risky] = "treasure"
+    w.item_spots[spot_safe] = "treasure"
+
+    risk.update(spot_risky, Observation.from_tokens(["damage"]))
+
+    plan = farm.choose_plan(start, "north", energy=100)
+    assert plan is not None and plan["goal"] == spot_safe, (
+        f"deveria preferir o alvo seguro {spot_safe} (mais longe) ao alvo "
+        f"perigoso {spot_risky} (mais perto), escolheu {plan['goal'] if plan else None}")
+    print("OK: farm evita zona de ameaca recente na escolha de alvo (nao so na fuga)")
+
+
 def test_combat_rules():
     from combat import CombatController
     from observations import Observation
@@ -1020,6 +1062,7 @@ if __name__ == "__main__":
     test_planner_risk_and_flee_are_reachable()
     test_risk_memory_does_not_poison_steps()
     test_farming_utility_and_pending_grabs()
+    test_farming_avoids_recent_danger_zone()
     test_combat_rules()
     test_damage_reaction_hunts_when_strong_evades_when_weak()
     test_survey_state_removed()

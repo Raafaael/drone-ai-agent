@@ -2,6 +2,7 @@
 
 import time
 
+from risk import DANGER_PENALTY
 from world_model import SAFE, UNKNOWN, neighbors
 
 SEC_PER_ACTION = 0.12
@@ -15,6 +16,21 @@ EARLY_FARM_DISCOUNT = 0.25
 FRONTIER_INFO_WEIGHT = 0.15
 PENDING_GRAB_TIMEOUT = 1.2
 POWERUP_PICKUP_ENERGY = 70
+# A escolha de alvo penalizava risco com um desconto FIXO (cell_penalty*0.05,
+# no maximo ~3.5 de uma ameaca recente de ate 70): irrelevante frente a
+# utilidades na casa das centenas/milhares, e mesmo corrigido para um peso
+# maior continuaria irrelevante, porque farm_utility() (valor/segundo) cresce
+# muito rapido para alvos proximos -- um alvo 1 passo mais perto ja vale
+# centenas de pontos a mais, o que nenhum desconto fixo de ate 70 supera.
+# Por isso o desconto por ameaca recente agora e MULTIPLICATIVO (corta uma
+# fracao do valor do proprio alvo, nao um numero fixo), e so risco de
+# poco/teleporte/revisita continua como desconto fixo (esses nao dependem de
+# comparar com um alvo mais proximo, so afinam a rota).
+# Sobrevivencia importa em toda partida (o enunciado encerra a partida do
+# agente ao morrer, nao so desconta -10), entao ameaca recente precisa pesar
+# de verdade na escolha do alvo, nao so na fuga reativa.
+DANGER_AVOIDANCE_FRACTION = 0.85
+ROUTE_PENALTY_WEIGHT = 0.3
 
 
 class FarmManager:
@@ -143,6 +159,17 @@ class FarmManager:
             self.spot_respawn[pos] = min(60.0, age + 1.5)
             self.spot_next_check[pos] = now + min(8.0, 1.5 * misses)
 
+    def _risk_adjusted_value(self, value, pos):
+        """Aplica o desconto de risco a um valor de alvo ja calculado:
+        ameaca recente corta uma FRACAO do proprio valor (proporcional,
+        nao um numero fixo -- ver DANGER_AVOIDANCE_FRACTION); poco/teleporte/
+        revisita continuam como desconto fixo, so para afinar a rota."""
+        danger = self.risk.danger_penalty(pos)
+        if danger:
+            value *= max(0.0, 1.0 - (danger / DANGER_PENALTY) * DANGER_AVOIDANCE_FRACTION)
+        value -= (self.risk.teleport_penalty(pos) + self.risk.revisit_penalty(pos)) * ROUTE_PENALTY_WEIGHT
+        return value
+
     def next_check_at(self, pos, now=None):
         now = now or time.time()
         if pos not in self.world.item_spots:
@@ -172,7 +199,7 @@ class FarmManager:
             if pos in self.last_taken:
                 value *= 1.0 - EARLY_FARM_DISCOUNT * early
             value -= self.spot_misses.get(pos, 0) * 35
-            value -= self.risk.cell_penalty(pos) * 0.05
+            value = self._risk_adjusted_value(value, pos)
             if best is None or value > best[0]:
                 best = (value, pos, "FARM")
 
@@ -184,7 +211,7 @@ class FarmManager:
                 continue
             info = self.frontier_info_gain(pos)
             value = explore_value * (1.0 + FRONTIER_INFO_WEIGHT * info) / (dd * SEC_PER_ACTION + 1.0)
-            value -= self.risk.cell_penalty(pos) * 0.05
+            value = self._risk_adjusted_value(value, pos)
             if best is None or value > best[0]:
                 best = (value, pos, "PLANO")
 

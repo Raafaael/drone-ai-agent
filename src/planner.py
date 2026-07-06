@@ -2,6 +2,13 @@
 
 from world_model import DANGER_FLASH
 
+# Peso do risco por celula do caminho (poco/teleporte/revisita/ameaca
+# recente). Menor que o peso usado na ESCOLHA do alvo (farm.py) porque aqui
+# se acumula por CADA celula do trajeto, nao uma vez so; ainda assim precisa
+# ser alto o suficiente para preferir um desvio a atravessar uma zona onde
+# o agente levou tiro/viu inimigo de perto ha pouco tempo.
+PATH_RISK_WEIGHT = 0.15
+
 
 class Planner:
     def __init__(self, world, risk=None):
@@ -13,7 +20,7 @@ class Planner:
         self._cache.clear()
 
     def _extra_cost(self, cell):
-        return self.risk.cell_penalty(cell) * 0.04 if self.risk else 0.0
+        return self.risk.cell_penalty(cell) * PATH_RISK_WEIGHT if self.risk else 0.0
 
     def reachable_map(self, start, allow_flash=False, allow_unknown=True):
         return self.world.reachable_map(start, allow_flash=allow_flash,
