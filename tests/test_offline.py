@@ -94,6 +94,67 @@ def test_fuzzy():
     print("OK: fuzzy (agressividade de combate)")
 
 
+def test_observation_normalization():
+    from observations import Observation, normalize_token
+
+    obs = Observation.from_tokens([
+        " blueLight ", "eneny#3", "h", "d", "steps", "", "greenLight",
+        "enemy#bad",
+    ])
+    assert "bluelight" in obs.tokens
+    assert "enemy#3" in obs.tokens
+    assert "hit" in obs.tokens and "damage" in obs.tokens
+    assert obs.enemy_distance == 3
+    assert obs.light == "treasure"
+    assert obs.steps
+    assert normalize_token("enemy#bad") == "enemy#5"
+    assert Observation.from_tokens(["weakLight"]).light == "unknown"
+    assert Observation.from_tokens(["redLight"]).light == "powerup"
+    assert Observation.from_tokens(["blocked"]).blocked
+    print("OK: observations (normalizacao e representacao estruturada)")
+
+
+def test_async_notifications_are_preserved():
+    from communication import GameAI
+
+    ai = GameAI(log=lambda m: None)
+    ai._handle_message(["notification", "damage"])
+    ai._handle_message(["h"])
+    assert "damage" in ai.observations and "hit" in ai.observations
+    ai._handle_message(["o", "enemy#3"])
+    assert "enemy#3" in ai.observations
+    assert "damage" in ai.observations and "hit" in ai.observations
+    assert ai.pending_observations == []
+    ai._handle_message(["o", ""])
+    assert "damage" not in ai.observations and "hit" not in ai.observations
+    ai._handle_message(["u", "p1", "100"])
+    assert ai.request_scoreboard_sync(timeout=0.01) is None
+    assert ai.scoreboard == ["p1", "100"]
+    print("OK: communication (hit/damage assincronos preservados)")
+
+
+def test_world_model_extended_features():
+    from observations import Observation
+
+    w = WorldModel()
+    w.update_pose(5, 5, "east")
+    assert w.position == (5, 5) and w.orientation == "east"
+    w.update_from_observation(5, 5, Observation.from_tokens([]))
+    w.update_from_observation(5, 5, Observation.from_tokens([]))
+    assert w.visit_count[(5, 5)] == 2
+    w.update_from_observation(10, 10, Observation.from_tokens(["flash"]))
+    assert w.teleport_risk(10, 9) > 0
+    assert w.safe_exit_count(5, 5) >= 1
+    w.mark_blocked(6, 5)
+    assert w.grid[6][5] == BLOCKED
+    old_version = w.version
+    w.reset()
+    assert w.version == 0 and w.position is None
+    assert all(cell == "?" for col in w.grid for cell in col)
+    assert old_version > 0
+    print("OK: world_model estendido (pose, visitas, teleporte, reset)")
+
+
 class MiniServer(threading.Thread):
     """Simulador minimo do GameServer (1 cliente) para teste de fumaca."""
 
@@ -281,6 +342,432 @@ def test_stale_data_discarded():
     print("OK: dados velhos descartados (timeout nao envenena o mapa)")
 
 
+def test_planner_risk_and_flee_are_reachable():
+    from planner import Planner
+    from risk import RiskModel
+    from world_model import DANGER_PIT, DANGER_FLASH
+
+    w = WorldModel()
+    risk = RiskModel(w)
+    planner = Planner(w, risk)
+    for x in range(5, 9):
+        w.update_from_observation(x, 5, [])
+    path = planner.a_star((5, 5), (8, 5), start_dir="east")
+    assert path == [(6, 5), (7, 5), (8, 5)]
+    w.grid[6][5] = DANGER_PIT
+    w.version += 1
+    assert planner.a_star((5, 5), (6, 5), start_dir="east") is None
+
+    w2 = WorldModel()
+    risk2 = RiskModel(w2)
+    planner2 = Planner(w2, risk2)
+    w2.update_from_observation(5, 5, [])
+    w2.grid[6][5] = DANGER_FLASH
+    w2.item_spots[(6, 5)] = "treasure"
+    w2.version += 1
+    assert planner2.a_star((5, 5), (6, 5), start_dir="east") is None
+    assert planner2.a_star((5, 5), (6, 5), start_dir="east", allow_flash=True)
+
+    w3 = WorldModel()
+    risk3 = RiskModel(w3)
+    planner3 = Planner(w3, risk3)
+    for x in range(5, 8):
+        w3.update_from_observation(x, 5, [])
+    w3.update_from_observation(5, 6, [])
+    w3.mark_blocked(6, 5)
+    target, flee_path = planner3.flee_plan(
+        (5, 5), "east", [(7, 5), (5, 6)],
+        lambda c: risk3.flee_score(c, (5, 5)),
+    )
+    assert target == (5, 6), (target, flee_path)
+    assert flee_path == [(5, 6)]
+    old = planner3.a_star((5, 5), (5, 6), start_dir="south")
+    w3.mark_blocked(5, 6)
+    new = planner3.a_star((5, 5), (5, 6), start_dir="south")
+    assert old and new is None
+    print("OK: planner (BFS/A*, cache, teleporte fallback, fuga alcancavel)")
+
+
+def test_risk_memory_does_not_poison_steps():
+    from observations import Observation
+    from risk import RiskModel
+
+    w = WorldModel()
+    risk = RiskModel(w)
+    risk.update((5, 5), Observation.from_tokens(["steps"]))
+    assert not w.danger_cells
+    assert w.threat_until > time.time()
+    risk.update((5, 5), Observation.from_tokens(["damage"]))
+    assert (5, 5) in w.danger_cells
+    assert risk.danger_penalty((5, 5)) > risk.danger_penalty((15, 15))
+    print("OK: risk (steps nao vira perigo permanente; damage vira zona quente)")
+
+
+def test_farming_utility_and_pending_grabs():
+    from farm import FarmManager
+    from planner import Planner
+    from risk import RiskModel
+
+    w = WorldModel()
+    risk = RiskModel(w)
+    planner = Planner(w, risk)
+    farm = FarmManager(w, planner, risk, log=lambda m: None)
+    for x in range(5, 12):
+        w.update_from_observation(x, 5, [])
+    w.item_spots[(6, 5)] = "powerup"
+    w.item_spots[(11, 5)] = "treasure"
+    plan = farm.choose_plan((5, 5), "east", energy=100)
+    assert plan["goal"] == (11, 5), plan
+    farm.record_grab((11, 5), 0, now=time.time())
+    assert len(farm.pending_grabs) == 1
+    farm.resolve_pending_grabs(1000, now=time.time() + 2)
+    assert farm.item_values[(11, 5)] == 1000
+    assert not farm.pending_grabs
+    assert not farm.due_spots(("treasure",), 100)
+    print("OK: farm (utilidade economica, pending_grabs, valor aprendido)")
+
+
+def test_combat_rules():
+    from combat import CombatController
+    from observations import Observation
+    from risk import RiskModel
+
+    w = WorldModel()
+    risk = RiskModel(w)
+    combat = CombatController(w, risk, profile="score", log=lambda m: None)
+    for y in range(2, 6):
+        w.update_from_observation(5, y, [])
+    w.update_pose(5, 5, "north")
+    assert not combat.should_attack(100, Observation.from_tokens(["steps"]))
+    assert combat.should_attack(100, Observation.from_tokens(["enemy#3"]))
+    w.mark_blocked(5, 4)
+    assert not combat.should_attack(100, Observation.from_tokens(["enemy#3"]))
+    assert combat.decide(100, Observation.from_tokens(["enemy#8"])) in (None, "CHASE")
+    assert combat.decide(20, Observation.from_tokens(["enemy#3"])) == "EVADE"
+    # energia baixa: sempre evade ao levar dano, mesmo com agressividade alta
+    assert combat.decide(20, Observation.from_tokens(["damage"])) == "EVADE"
+    # energia/agressividade suficientes (perfil score): contra-ataca em vez de so fugir
+    assert combat.decide(60, Observation.from_tokens(["damage"])) == "HUNT"
+    assert combat.hunt_reason == "damage"
+    combat.record_shot()
+    combat.update_after_observation(Observation.from_tokens(["hit"]))
+    assert combat.shots_hit == 1 and combat.shots_since_hit == 0
+    combat.shots_since_hit = combat.miss_limit(6)
+    assert combat.after_miss_limit(6)
+    aggressive = CombatController(w, risk, profile="aggressive", log=lambda m: None)
+    aggressive.shots_fired = aggressive.initial_miss_limit
+    aggressive.shots_hit = 0
+    w.grid[5][4] = VISITED
+    assert not aggressive.should_attack(100, Observation.from_tokens(["enemy#3"]))
+    assert aggressive.engage_pause_until > time.time()
+    print("OK: combat (linha de tiro, steps, hit, miss limit, evade/chase)")
+
+
+class FakeAI:
+    def __init__(self, views):
+        self.views = list(views)
+        self.actions = []
+        self.score = 0
+        self.energy = 100
+        self.x = 5
+        self.y = 5
+        self.direction = "north"
+        self.observation = []
+        self.pending_events = []
+
+    def request_sync_pair(self, timeout=0.5):
+        self.actions.extend(["q", "o"])
+        if not self.views:
+            return (self.x, self.y, self.direction, "game", self.score, self.energy,
+                    list(self.observation))
+        view = self.views.pop(0)
+        self.x, self.y, self.direction = view[0], view[1], view[2]
+        self.score = view[4]
+        self.energy = view[5]
+        self.observation = list(view[6])
+        return view
+
+    def request_status_sync(self, timeout=0.5):
+        self.actions.append("q")
+        return self.x, self.y, self.direction, "game", self.score, self.energy
+
+    def request_observation_sync(self, timeout=0.5):
+        self.actions.append("o")
+        obs = list(self.observation)
+        obs.extend(self.consume_pending_events())
+        return obs
+
+    def consume_pending_events(self):
+        events = list(self.pending_events)
+        self.pending_events.clear()
+        return events
+
+    def send_forward(self):
+        self.actions.append("w")
+        vec = {"north": (0, -1), "east": (1, 0), "south": (0, 1), "west": (-1, 0)}
+        dx, dy = vec[self.direction]
+        self.x += dx
+        self.y += dy
+    def send_backward(self): self.actions.append("s")
+    def send_turn_left(self):
+        self.actions.append("a")
+        self.direction = {"north": "west", "west": "south", "south": "east", "east": "north"}[self.direction]
+    def send_turn_right(self):
+        self.actions.append("d")
+        self.direction = {"north": "east", "east": "south", "south": "west", "west": "north"}[self.direction]
+    def send_get_item(self):
+        self.actions.append("t")
+        self.observation = []
+    def send_shoot(self): self.actions.append("e")
+
+
+def test_strategy_fsm_profiles_and_reset():
+    from strategy import DroneAgent
+
+    ai = FakeAI([(5, 5, "north", "game", 0, 60, ["blueLight"])])
+    agent = DroneAgent(ai, log=lambda m: None, profile="score")
+    agent.act()
+    assert "t" in ai.actions and agent.state == "EXPLORE"
+
+    ai2 = FakeAI([(5, 5, "north", "game", 0, 20, ["damage"])])
+    agent2 = DroneAgent(ai2, log=lambda m: None, profile="safe")
+    agent2.world.update_from_observation(5, 5, [])
+    agent2.world.update_from_observation(6, 5, [])
+    agent2.act()
+    assert agent2.state in ("EVADE", "FLEE", "EXPLORE")
+    assert agent2.profile == "safe"
+
+    ai3 = FakeAI([])
+    agent3 = DroneAgent(ai3, log=lambda m: None, aggressive=True)
+    assert agent3.profile == "aggressive"
+    agent3.world.update_from_observation(1, 1, [])
+    assert agent3.world.visit_count
+    agent3.reset_for_new_game()
+    assert not agent3.world.visit_count and agent3.state == "EXPLORE"
+    print("OK: strategy (FSM, perfis, reset completo)")
+
+
+def test_aggressive_typo_alias():
+    from main import parse_args
+
+    args = parse_args(["--aggresive"])
+    assert args.aggressive
+    print("OK: main (--aggresive aceito como alias)")
+
+
+def test_economical_observation_policy():
+    from strategy import DroneAgent
+
+    ai = FakeAI([(5, 5, "north", "game", 0, 100, [])])
+    agent = DroneAgent(ai, log=lambda m: None, profile="score")
+    agent.act()
+    ai.actions.clear()
+
+    agent.world.item_spots[(5, 5)] = "treasure"
+    agent.farm.last_taken[(5, 5)] = time.time()
+    agent.farm.spot_respawn[(5, 5)] = 30.0
+    agent.farm.spot_next_check[(5, 5)] = time.time() + 30.0
+    agent.state = "CAMP"
+    agent.farm.has_better_reachable_plan = lambda *args, **kwargs: False
+    agent._need_status = False
+    agent._need_observation = False
+    agent._last_status_at = time.time()
+    agent._last_observation_at = time.time()
+
+    for _ in range(20):
+        agent.act()
+    assert "o" not in ai.actions and "q" not in ai.actions, ai.actions
+    assert agent.metrics.idle_without_command >= 20
+    print("OK: economia de observacao (camp espera sem q/o continuo)")
+
+
+def test_observe_after_movement_not_each_idle_tick():
+    from strategy import DroneAgent
+
+    ai = FakeAI([])
+    agent = DroneAgent(ai, log=lambda m: None, profile="score")
+    agent._cached_view = (5, 5, "north", "game", 0, 100, [])
+    agent._last_status_at = time.time()
+    agent._last_observation_at = time.time()
+    agent._need_status = False
+    agent._need_observation = False
+    ai.x, ai.y, ai.direction = 5, 5, "north"
+    agent.world.update_from_observation(5, 5, [])
+    agent.world.update_from_observation(5, 4, [])
+    agent.path = [(5, 4)]
+    agent.act()
+    assert "w" in ai.actions
+    agent.act()
+    assert "q" in ai.actions and "o" in ai.actions, ai.actions
+    print("OK: economia de observacao (movimento solicita q/o no tick seguinte)")
+
+
+def test_steps_do_not_cancel_safe_route_or_shoot():
+    from strategy import DroneAgent
+
+    ai = FakeAI([])
+    agent = DroneAgent(ai, log=lambda m: None, profile="score")
+    agent._cached_view = (5, 5, "north", "game", 0, 100, ["steps"])
+    agent._last_status_at = time.time()
+    agent._last_observation_at = time.time()
+    agent._need_status = False
+    agent._need_observation = False
+    ai.x, ai.y, ai.direction = 5, 5, "north"
+    ai.observation = ["steps"]
+    agent.world.update_from_observation(5, 5, [])
+    agent.world.update_from_observation(5, 4, [])
+    agent.path = [(5, 4)]
+    agent.act()
+    assert "e" not in ai.actions
+    assert "w" in ai.actions
+    print("OK: steps isolado nao atira nem cancela rota segura")
+
+
+def test_aggressive_idle_does_not_poll_faster_without_enemy():
+    from strategy import DroneAgent
+
+    ai = FakeAI([(5, 5, "north", "game", 0, 100, [])])
+    agent = DroneAgent(ai, log=lambda m: None, profile="aggressive")
+    agent.act()
+    ai.actions.clear()
+    agent.world.item_spots[(5, 5)] = "treasure"
+    agent.farm.last_taken[(5, 5)] = time.time()
+    agent.farm.spot_respawn[(5, 5)] = 30.0
+    agent.farm.spot_next_check[(5, 5)] = time.time() + 30.0
+    agent.state = "CAMP"
+    agent.farm.has_better_reachable_plan = lambda *args, **kwargs: False
+    agent._need_status = False
+    agent._need_observation = False
+    agent._last_status_at = time.time()
+    agent._last_observation_at = time.time()
+    for _ in range(20):
+        agent.act()
+    assert ai.actions.count("o") == 0 and ai.actions.count("q") == 0, ai.actions
+    print("OK: aggressive ocioso nao aumenta consultas sem inimigo")
+
+
+def test_camp_without_current_light_is_deferred():
+    from strategy import DroneAgent
+
+    ai = FakeAI([])
+    agent = DroneAgent(ai, log=lambda m: None, profile="score")
+    agent._cached_view = (6, 12, "north", "game", 0, 100, [])
+    agent._last_status_at = time.time()
+    agent._last_observation_at = time.time()
+    agent._need_status = False
+    agent._need_observation = False
+    ai.x, ai.y, ai.direction = 6, 12, "north"
+    agent.world.update_from_observation(6, 12, [])
+    agent.world.item_spots[(6, 12)] = "treasure"
+    agent.state = "CAMP"
+    agent.act()
+    assert agent.state != "CAMP"
+    assert agent.farm.spot_next_check[(6, 12)] > time.time()
+    ai.actions.clear()
+    for _ in range(5):
+        agent.act()
+    assert agent.state != "CAMP"
+    assert any(a in ai.actions for a in ("w", "a", "d")) or agent.metrics.idle_without_command > 0
+    print("OK: camp sem luz atual e adiado para evitar loop estatico")
+
+
+def prepare_blocked_chase_agent(profile="score", obs=None):
+    from strategy import DroneAgent
+
+    ai = FakeAI([])
+    agent = DroneAgent(ai, log=lambda m: None, profile=profile)
+    tokens = obs if obs is not None else ["enemy#6"]
+    agent._cached_view = (26, 23, "east", "game", 0, 100, tokens)
+    agent._last_status_at = time.time()
+    agent._last_observation_at = time.time()
+    agent._need_status = False
+    agent._need_observation = False
+    ai.x, ai.y, ai.direction = 26, 23, "east"
+    ai.observation = list(tokens)
+    agent.world.update_from_observation(26, 23, [])
+    agent.world.update_from_observation(26, 22, [])
+    agent.world.update_from_observation(26, 24, [])
+    agent.world.update_from_observation(25, 23, [])
+    agent.world.mark_blocked(27, 23)
+    agent.world.update_pose(26, 23, "east")
+    return agent, ai
+
+
+def test_blocked_chase_does_not_oscillate_hunt_chase():
+    agent, ai = prepare_blocked_chase_agent("score")
+    for _ in range(8):
+        agent.act()
+    snap = agent.metrics_snapshot()
+    assert snap["transitions"].get("CHASE->HUNT", 0) <= 1, snap
+    assert snap["transitions"].get("HUNT->CHASE", 0) == 0, snap
+    assert agent.state in ("REPOSITION", "EVADE", "EXPLORE", "ATTACK", "FLEE", "CHASE")
+    assert snap["blocked_chase_failures"] >= 1
+    assert "w" in ai.actions or "d" in ai.actions or snap["chases_abandoned"] >= 1
+    print("OK: chase bloqueado nao oscila CHASE/HUNT")
+
+
+def test_repeated_blocked_chase_adds_cooldown_and_changes_strategy():
+    agent, ai = prepare_blocked_chase_agent("score")
+    agent.act()
+    first = agent.metrics_snapshot()["blocked_chase_failures"]
+    agent._set_state("CHASE", "teste repeticao")
+    agent.act()
+    snap = agent.metrics_snapshot()
+    assert snap["blocked_chase_failures"] == first
+    assert snap["repeated_blocks"] >= 1
+    assert agent.state != "CHASE"
+    assert ai.actions.count("w") <= 1
+    print("OK: mesmo bloqueio ativa cooldown e evita repetir chase")
+
+
+def test_stale_enemy_observation_does_not_reactivate_chase():
+    agent, ai = prepare_blocked_chase_agent("score")
+    agent._enemy_seen_at = time.time() - 10
+    agent.act()
+    assert agent.state != "CHASE"
+    assert agent.metrics_snapshot()["chases_abandoned"] >= 1 or "e" not in ai.actions
+    print("OK: enemy antigo expira e nao reativa chase")
+
+
+def test_blocked_chase_repositions_laterally_when_safe():
+    agent, ai = prepare_blocked_chase_agent("aggressive")
+    agent.act()
+    assert agent.state in ("REPOSITION", "HUNT", "EXPLORE", "ATTACK")
+    for _ in range(3):
+        agent.act()
+    assert "w" in ai.actions or agent.metrics_snapshot()["repositions"] >= 1
+    assert (agent.world.position != (26, 23)) or "w" in ai.actions
+    print("OK: chase bloqueado tenta reposicionamento lateral seguro")
+
+
+def test_blocked_chase_without_flank_evades_or_abandons():
+    agent, ai = prepare_blocked_chase_agent("safe")
+    agent.world.mark_blocked(26, 22)
+    agent.world.mark_blocked(26, 24)
+    agent.act()
+    for _ in range(3):
+        agent.act()
+    assert agent.state in ("EVADE", "FLEE", "EXPLORE", "REPOSITION")
+    assert agent.metrics_snapshot()["transitions"].get("HUNT->CHASE", 0) == 0
+    print("OK: sem flanqueamento, abandona/foge em vez de hunt infinito")
+
+
+def test_failed_chase_restores_previous_farm_plan():
+    agent, ai = prepare_blocked_chase_agent("score")
+    agent.world.update_from_observation(25, 23, [])
+    agent._previous_plan = {
+        "goal": (25, 23),
+        "path": [(25, 23)],
+        "allows_flash": False,
+        "saved_at": time.time(),
+    }
+    agent.config["max_blocked_chase_failures"] = 0
+    agent.act()
+    assert agent.goal == (25, 23) or agent.metrics_snapshot()["previous_plan_restored"] >= 1
+    assert agent.state == "EXPLORE"
+    print("OK: chase falho pode restaurar plano de farm/exploracao anterior")
+
+
 def test_farming():
     """Itens reaparecem: numa sala minuscula ja explorada, o agente deve
     ACAMPAR sobre o ponto de tesouro e coleta-lo a cada respawn,
@@ -317,9 +804,240 @@ def test_farming():
     print(f"OK: farming (coletas repetidas no mesmo ponto, score={server.score})")
 
 
+def test_damage_reaction_hunts_when_strong_evades_when_weak():
+    """Regressao: combat.decide() setava hunt_reason='damage' mas sempre
+    retornava EVADE (o HUNT nunca era alcancado), e strategy.decide_state()
+    tinha seu PROPRIO 'if observation.damage: return EVADE' incondicional,
+    que nem chegava a chamar combat.decide(). Os dois pontos foram
+    corrigidos: agora perfis com energia/agressividade suficientes reagem a
+    dano com HUNT (contra-ataque); energia baixa e o perfil 'safe' (limiar
+    de agressividade mais alto) continuam evadindo."""
+    from combat import CombatController
+    from observations import Observation
+    from risk import RiskModel
+    from strategy import DroneAgent
+
+    w = WorldModel()
+    risk = RiskModel(w)
+    dmg = Observation.from_tokens(["damage"])
+
+    # energia moderada/alta e agressividade suficiente -> HUNT, por perfil
+    score = CombatController(w, risk, profile="score", log=lambda m: None)
+    assert score.decide(60, dmg) == "HUNT" and score.hunt_reason == "damage"
+
+    aggressive = CombatController(w, risk, profile="aggressive", log=lambda m: None)
+    assert aggressive.decide(60, dmg) == "HUNT" and aggressive.hunt_reason == "damage"
+
+    safe = CombatController(w, risk, profile="safe", log=lambda m: None)
+    # mesma energia/distancia assumida, mas o limiar de agressividade do
+    # perfil 'safe' e mais alto: continua evadindo em vez de contra-atacar
+    assert safe.decide(60, dmg) == "EVADE"
+
+    # energia baixa: SEMPRE evade, independente do perfil
+    for profile in ("score", "aggressive", "safe"):
+        combat = CombatController(w, risk, profile=profile, log=lambda m: None)
+        assert combat.decide(20, dmg) == "EVADE", f"perfil {profile} deveria evadir com energia baixa"
+
+    # verificacao fim-a-fim: strategy.decide_state precisa REALMENTE chamar
+    # combat.decide() para o caso de dano (o bug antigo tinha um segundo
+    # atalho hardcoded em strategy.py que nunca deixava isso acontecer)
+    ai = FakeAI([(5, 5, "north", "game", 0, 60, ["damage"])])
+    agent = DroneAgent(ai, log=lambda m: None, profile="aggressive")
+    agent.act()
+    assert agent.state == "HUNT", f"esperado HUNT, obtido {agent.state}"
+
+    ai_safe = FakeAI([(5, 5, "north", "game", 0, 60, ["damage"])])
+    agent_safe = DroneAgent(ai_safe, log=lambda m: None, profile="safe")
+    agent_safe.act()
+    assert agent_safe.state == "EVADE", f"esperado EVADE, obtido {agent_safe.state}"
+
+    ai_low = FakeAI([(5, 5, "north", "game", 0, 15, ["damage"])])
+    agent_low = DroneAgent(ai_low, log=lambda m: None, profile="aggressive")
+    agent_low.act()
+    assert agent_low.state == "EVADE", f"energia critica deveria evadir, obtido {agent_low.state}"
+
+    print("OK: reacao a damage (HUNT quando forte, EVADE quando fraco/energia baixa/perfil safe)")
+
+
+def test_survey_state_removed():
+    """SURVEY era um estado morto: existia em STATES, tinha handler e
+    dispatch, mas nada em strategy.py jamais setava state='SURVEY' nem
+    survey_turns>0 (achado da auditoria). Foi removido em vez de receber
+    uma condicao de entrada nova. Este teste garante que ele nao volta a
+    existir 'a toa' (nome sem comportamento) na FSM."""
+    from strategy import DroneAgent
+
+    ai = FakeAI([])
+    agent = DroneAgent(ai, log=lambda m: None)
+    assert "SURVEY" not in agent.STATES
+    assert not hasattr(agent, "survey_turns")
+    assert not hasattr(agent, "do_survey")
+    print("OK: SURVEY removido (sem estado morto na FSM)")
+
+
+def test_no_stale_observation_reuse_after_critical_actions():
+    """Regressao (classe de bug ja encontrada uma vez em do_grab nesta
+    sessao): qualquer acao que muda o estado do lado do servidor precisa
+    forcar uma observacao fresca no proximo tick, em vez de reaproveitar a
+    observacao em cache de ANTES da acao. Cobre GRAB, SHOOT, 'blocked' e
+    mudanca de celula."""
+    from strategy import DroneAgent
+
+    # 1) apos GRAB: observacao fresca exigida e luz obsoleta removida do cache
+    ai = FakeAI([(5, 5, "north", "game", 0, 100, ["blueLight"])])
+    agent = DroneAgent(ai, log=lambda m: None, profile="score")
+    agent.act()
+    assert agent.last_action == "grab"
+    assert agent._need_observation is True, "GRAB deve forcar reobservacao no proximo tick"
+    _, _, _, _, _, _, tokens = agent._cached_view
+    assert "bluelight" not in [t.lower() for t in tokens], \
+        "luz obsoleta deveria ter sido limpa do cache apos o grab"
+
+    # 2) apos SHOOT: observacao fresca exigida para saber se houve 'hit'
+    ai2 = FakeAI([(5, 5, "north", "game", 0, 100, ["enemy#2"])])
+    agent2 = DroneAgent(ai2, log=lambda m: None, profile="aggressive")
+    agent2.world.update_from_observation(5, 5, [])
+    agent2.act()
+    assert agent2.last_action == "shoot", f"esperado tiro, obtido {agent2.last_action}"
+    assert agent2._need_observation is True, "tiro deve forcar reobservacao (hit/miss)"
+
+    # 3) apos 'blocked': mapa/rota precisam ser recalculados com dado fresco
+    ai3 = FakeAI([(5, 5, "north", "game", 0, 100, ["blocked"])])
+    agent3 = DroneAgent(ai3, log=lambda m: None, profile="score")
+    agent3.path = [(5, 4)]
+    agent3.act()
+    assert agent3._need_observation is True, "'blocked' deve forcar reobservacao"
+
+    # 4) apos mudanca de celula (forward bem-sucedido): o tick seguinte nao
+    # deve decidir com o status/observacao antigos da celula anterior
+    ai4 = FakeAI([])
+    agent4 = DroneAgent(ai4, log=lambda m: None, profile="score")
+    agent4._cached_view = (5, 5, "north", "game", 0, 100, [])
+    agent4._last_status_at = time.time()
+    agent4._last_observation_at = time.time()
+    agent4._need_status = False
+    agent4._need_observation = False
+    ai4.x, ai4.y, ai4.direction = 5, 5, "north"
+    agent4.world.update_from_observation(5, 5, [])
+    agent4.world.update_from_observation(5, 4, [])
+    agent4.path = [(5, 4)]
+    agent4.act()
+    assert "w" in ai4.actions
+    assert agent4._need_status is True and agent4._need_observation is True, \
+        "apos mudar de celula, o proximo tick precisa pedir status/observacao novos"
+
+    print("OK: sem reuso de observacao obsoleta apos GRAB/SHOOT/blocked/mudanca de celula")
+
+
+def test_player_state_reset_on_new_game():
+    """Regressao: ai.player_state so e atualizado quando chega uma mensagem
+    's' do servidor, recebida dentro de agent.act(). Se o drone morreu na
+    partida anterior (player_state='dead') e uma partida nova comeca, o loop
+    principal nunca chama agent.act() enquanto acha que ainda esta morto --
+    travando para sempre, mesmo com o drone vivo de novo. main.py agora
+    reseta player_state ao detectar uma partida nova; sem esse reset, o loop
+    (rodado aqui numa thread com timeout) nunca terminaria."""
+    import main as main_module
+
+    class FakeGameAI:
+        def __init__(self, log=print):
+            self.connected = True
+            self.game_status = "Game"
+            self.player_state = "dead"  # sobra da partida anterior
+            self.score = 0
+            self.energy = 100
+            self.player_x = 5
+            self.player_y = 5
+            self.player_dir = "north"
+
+        def connect(self, host, name, port=8888):
+            return True
+
+        def send_color(self, r, g, b):
+            pass
+
+        def send_request_game_status(self):
+            pass
+
+        def request_scoreboard_sync(self, timeout=0.4):
+            return []
+
+        def disconnect(self):
+            self.connected = False
+
+    class FakeFarm:
+        collect_by_kind = {}
+        collect_count = 0
+
+    class FakeWorld:
+        item_spots = {}
+
+    created_agents = []
+
+    class FakeAgent:
+        def __init__(self, ai, log=print, profile="score"):
+            self.ai = ai
+            self.state = "EXPLORE"
+            self.config = {}
+            self.farm = FakeFarm()
+            self.world = FakeWorld()
+            self.acted = 0
+            created_agents.append(self)
+
+        def act(self):
+            self.acted += 1
+            self.ai.connected = False  # encerra o loop apos 1 acao bem-sucedida
+
+        def metrics_snapshot(self):
+            return {}
+
+    fake_ai = FakeGameAI()
+    orig_game_ai, orig_agent = main_module.GameAI, main_module.DroneAgent
+    main_module.GameAI = lambda log=print: fake_ai
+    main_module.DroneAgent = FakeAgent
+    try:
+        thread = threading.Thread(target=main_module.main, args=(["127.0.0.1", "Teste"],), daemon=True)
+        thread.start()
+        thread.join(timeout=2.0)
+        assert not thread.is_alive(), (
+            "loop principal travou: player_state 'dead' da partida anterior "
+            "nunca foi resetado, entao agent.act() nunca roda na partida nova")
+        # main() cria um DroneAgent antes do loop e outro ao detectar a
+        # partida nova (was_in_game False -> True); o que importa e que
+        # ALGUM deles chegou a agir (nao travou antes disso).
+        assert created_agents and any(a.acted >= 1 for a in created_agents)
+    finally:
+        main_module.GameAI, main_module.DroneAgent = orig_game_ai, orig_agent
+    print("OK: player_state 'dead' da partida anterior nao trava a partida nova")
+
+
 if __name__ == "__main__":
+    test_observation_normalization()
+    test_async_notifications_are_preserved()
     test_world_model()
+    test_world_model_extended_features()
     test_fuzzy()
+    test_planner_risk_and_flee_are_reachable()
+    test_risk_memory_does_not_poison_steps()
+    test_farming_utility_and_pending_grabs()
+    test_combat_rules()
+    test_damage_reaction_hunts_when_strong_evades_when_weak()
+    test_survey_state_removed()
+    test_no_stale_observation_reuse_after_critical_actions()
+    test_strategy_fsm_profiles_and_reset()
+    test_aggressive_typo_alias()
+    test_player_state_reset_on_new_game()
+    test_economical_observation_policy()
+    test_observe_after_movement_not_each_idle_tick()
+    test_steps_do_not_cancel_safe_route_or_shoot()
+    test_aggressive_idle_does_not_poll_faster_without_enemy()
+    test_camp_without_current_light_is_deferred()
+    test_blocked_chase_does_not_oscillate_hunt_chase()
+    test_repeated_blocked_chase_adds_cooldown_and_changes_strategy()
+    test_stale_enemy_observation_does_not_reactivate_chase()
+    test_blocked_chase_repositions_laterally_when_safe()
+    test_blocked_chase_without_flank_evades_or_abandons()
+    test_failed_chase_restores_previous_farm_plan()
     test_smoke_agent()
     test_pit_avoidance()
     test_stale_data_discarded()

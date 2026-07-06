@@ -3,6 +3,7 @@
 import socket
 import threading
 import time
+from collections import Counter
 
 from observations import Observation, normalize_token, normalize_tokens, parse_observation_payload
 
@@ -109,6 +110,12 @@ class GameAI:
         self.observations = []
         self.latest_observation = Observation()
         self.pending_observations = []
+        self.last_observation_at = 0.0
+        self.last_status_at = 0.0
+        self.last_game_status_at = 0.0
+        self.last_scoreboard_at = 0.0
+        self.command_counts = Counter()
+        self.total_commands = 0
 
         self.obs_event = threading.Event()
         self.status_event = threading.Event()
@@ -131,21 +138,37 @@ class GameAI:
     def connected(self):
         return self.client.connected
 
-    def send_forward(self): return self.client.send_msg("w")
-    def send_backward(self): return self.client.send_msg("s")
-    def send_turn_left(self): return self.client.send_msg("a")
-    def send_turn_right(self): return self.client.send_msg("d")
-    def send_get_item(self): return self.client.send_msg("t")
-    def send_shoot(self): return self.client.send_msg("e")
-    def send_request_observation(self): return self.client.send_msg("o")
-    def send_request_game_status(self): return self.client.send_msg("g")
-    def send_request_user_status(self): return self.client.send_msg("q")
-    def send_request_position(self): return self.client.send_msg("p")
-    def send_request_scoreboard(self): return self.client.send_msg("u")
-    def send_goodbye(self): return self.client.send_msg("quit")
-    def send_name(self, name): return self.client.send_msg(f"name;{name}")
-    def send_say(self, msg): return self.client.send_msg(f"say;{msg}")
-    def send_color(self, r, g, b): return self.client.send_msg(f"color;{r};{g};{b}")
+    def _send_command(self, msg):
+        ok = self.client.send_msg(msg)
+        if ok:
+            cmd = msg.split(";", 1)[0]
+            with self.lock:
+                self.command_counts[cmd] += 1
+                self.total_commands += 1
+        return ok
+
+    def command_metrics(self):
+        with self.lock:
+            return {
+                "total_commands": self.total_commands,
+                "commands": dict(self.command_counts),
+            }
+
+    def send_forward(self): return self._send_command("w")
+    def send_backward(self): return self._send_command("s")
+    def send_turn_left(self): return self._send_command("a")
+    def send_turn_right(self): return self._send_command("d")
+    def send_get_item(self): return self._send_command("t")
+    def send_shoot(self): return self._send_command("e")
+    def send_request_observation(self): return self._send_command("o")
+    def send_request_game_status(self): return self._send_command("g")
+    def send_request_user_status(self): return self._send_command("q")
+    def send_request_position(self): return self._send_command("p")
+    def send_request_scoreboard(self): return self._send_command("u")
+    def send_goodbye(self): return self._send_command("quit")
+    def send_name(self, name): return self._send_command(f"name;{name}")
+    def send_say(self, msg): return self._send_command(f"say;{msg}")
+    def send_color(self, r, g, b): return self._send_command(f"color;{r};{g};{b}")
 
     def _remember_async_observation(self, obs_name):
         obs_name = normalize_token(obs_name)
@@ -173,6 +196,7 @@ class GameAI:
                 self.pending_observations.clear()
                 self.latest_observation = Observation.from_tokens(tokens)
                 self.observations = self.latest_observation.as_list
+                self.last_observation_at = time.time()
             self.obs_event.set()
             return
         if head == "s":
@@ -184,6 +208,7 @@ class GameAI:
                     self.player_state = cmd[4].lower()
                     self.score = int(cmd[5])
                     self.energy = int(cmd[6])
+                    self.last_status_at = time.time()
                 self.status_event.set()
             except (IndexError, ValueError):
                 self.log(f"[REDE] Status invalido: {cmd}")
@@ -206,11 +231,13 @@ class GameAI:
                         self.game_time = int(cmd[2])
                     except ValueError:
                         pass
+                self.last_game_status_at = time.time()
             self.game_event.set()
             return
         if head == "u":
             with self.lock:
                 self.scoreboard = cmd[1:]
+                self.last_scoreboard_at = time.time()
             self.scoreboard_event.set()
             return
         if head == "notification":
@@ -225,6 +252,25 @@ class GameAI:
         if head in ("hello", "goodbye"):
             self.log(f"[SERVIDOR] {';'.join(cmd)}")
 
+    def has_pending_events(self):
+        with self.lock:
+            return bool(self.pending_observations)
+
+    def consume_pending_events(self):
+        """Return async hit/damage events without sending a new observation command."""
+        with self.lock:
+            events = list(self.pending_observations)
+            self.pending_observations.clear()
+            if events:
+                tokens = list(self.observations)
+                seen = set(tokens)
+                for event in events:
+                    if event not in seen:
+                        tokens.append(event)
+                self.latest_observation = Observation.from_tokens(tokens)
+                self.observations = self.latest_observation.as_list
+            return events
+
     def request_observation_sync(self, timeout=1.0):
         self.obs_event.clear()
         if not self.send_request_observation():
@@ -232,6 +278,7 @@ class GameAI:
         if not self.obs_event.wait(timeout):
             return None
         with self.lock:
+            self.last_observation_at = time.time()
             return list(self.observations)
 
     def request_status_sync(self, timeout=1.0):
@@ -241,6 +288,7 @@ class GameAI:
         if not self.status_event.wait(timeout):
             return None
         with self.lock:
+            self.last_status_at = time.time()
             return (self.player_x, self.player_y, self.player_dir,
                     self.player_state, self.score, self.energy)
 
@@ -251,6 +299,7 @@ class GameAI:
         if not self.game_event.wait(timeout):
             return None
         with self.lock:
+            self.last_game_status_at = time.time()
             return self.game_status, self.game_time
 
     def request_scoreboard_sync(self, timeout=0.5):
@@ -260,6 +309,7 @@ class GameAI:
         if not self.scoreboard_event.wait(timeout):
             return None
         with self.lock:
+            self.last_scoreboard_at = time.time()
             return list(self.scoreboard)
 
     def request_sync_pair(self, timeout=0.5):
@@ -273,6 +323,9 @@ class GameAI:
         if not ok:
             return None
         with self.lock:
+            now = time.time()
+            self.last_status_at = now
+            self.last_observation_at = now
             return (self.player_x, self.player_y, self.player_dir,
                     self.player_state, self.score, self.energy,
                     list(self.observations))

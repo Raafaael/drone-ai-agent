@@ -1,36 +1,31 @@
-"""
-Modelo de mundo do drone: mapa 59x34 com conhecimento incremental,
-inferencia logica estilo "Mundo de Wumpus" sobre os sensores
-(breeze -> poco adjacente, flash -> teleporte adjacente) e busca
-de caminhos com A*.
-
-O agente nao conhece o mapa: tudo aqui e deduzido das observacoes.
-"""
+"""Incremental 59x34 world model for the drone challenge."""
 
 import heapq
 from collections import deque
 
+from observations import Observation
+
 WIDTH = 59
 HEIGHT = 34
 
-# Estados de conhecimento de cada celula
-UNKNOWN = "?"          # nunca visitada nem inferida
-SAFE = "."             # inferida segura (sem poco/teleporte)
-VISITED = "v"          # ja pisada (segura por definicao)
-BLOCKED = "#"          # parede/obstaculo (impacto ao andar)
-DANGER_PIT = "P"       # possivel poco
-DANGER_FLASH = "T"     # possivel teleporte
-DANGER_BOTH = "X"      # possivel poco e teleporte
-
+UNKNOWN = "?"
+SAFE = "."
+VISITED = "v"
+BLOCKED = "#"
+DANGER_PIT = "P"
+DANGER_FLASH = "T"
+DANGER_BOTH = "X"
 DANGEROUS = {DANGER_PIT, DANGER_FLASH, DANGER_BOTH}
 
-# vetores de direcao: north diminui y (convencao do GameServer)
 DIR_VECTORS = {
     "north": (0, -1),
     "east": (1, 0),
     "south": (0, 1),
     "west": (-1, 0),
 }
+
+TURN_LEFT_OF = {"north": "west", "west": "south", "south": "east", "east": "north"}
+TURN_RIGHT_OF = {"north": "east", "east": "south", "south": "west", "west": "north"}
 
 
 def in_bounds(x, y):
@@ -44,87 +39,117 @@ def neighbors(x, y):
             yield nx, ny
 
 
+def turn_cost(current_dir, target_dir):
+    if current_dir is None or current_dir == target_dir:
+        return 0
+    if TURN_LEFT_OF[current_dir] == target_dir or TURN_RIGHT_OF[current_dir] == target_dir:
+        return 1
+    return 2
+
+
 class WorldModel:
     def __init__(self):
+        self.reset()
+
+    def reset(self):
         self.grid = [[UNKNOWN] * HEIGHT for _ in range(WIDTH)]
-        # celulas onde ja sentimos brisa/flash (para re-inferencia)
         self.breeze_cells = set()
         self.flash_cells = set()
-        # celulas comprovadamente livres de poco / teleporte
         self.no_pit = set()
         self.no_flash = set()
-        # resolucao logica: pocos/teleportes CONFIRMADOS por eliminacao
-        # (brisa cujo unico vizinho nao-exonerado so pode ser o poco)
         self.confirmed_pits = set()
         self.confirmed_teleports = set()
-        # itens vistos AGORA no chao: (x, y) -> "treasure" | "powerup" | "unknown"
         self.items = {}
-        # memoria PERMANENTE de pontos de item (itens reaparecem -> farming)
         self.item_spots = {}
+        self.visit_count = {}
+        self.position = None
+        self.orientation = "north"
+        self.danger_cells = {}
+        self.last_danger_cell = None
+        self.threat_until = 0.0
+        self.recent_positions = []
+        self.version = 0
 
-    # ---------------- atualizacao de conhecimento ----------------
+    def _changed(self):
+        self.version += 1
+
+    def update_pose(self, x, y, direction):
+        self.position = (x, y)
+        self.orientation = direction
 
     def mark_visited(self, x, y):
         if not in_bounds(x, y):
             return
+        old = self.grid[x][y]
         self.grid[x][y] = VISITED
         self.no_pit.add((x, y))
         self.no_flash.add((x, y))
+        self.visit_count[(x, y)] = self.visit_count.get((x, y), 0) + 1
+        if not self.recent_positions or self.recent_positions[-1] != (x, y):
+            self.recent_positions.append((x, y))
+            if len(self.recent_positions) > 40:
+                self.recent_positions.pop(0)
+        if old != VISITED:
+            self._changed()
+
+    def mark_safe(self, x, y):
+        if not in_bounds(x, y) or self.grid[x][y] in (VISITED, BLOCKED):
+            return
+        if self.grid[x][y] != SAFE:
+            self.grid[x][y] = SAFE
+            self._changed()
 
     def mark_blocked(self, x, y):
-        if in_bounds(x, y):
+        if in_bounds(x, y) and self.grid[x][y] != BLOCKED:
             self.grid[x][y] = BLOCKED
+            self.items.pop((x, y), None)
+            self._changed()
+
+    def front_cell(self, x=None, y=None, direction=None):
+        if x is None or y is None:
+            if self.position is None:
+                return None
+            x, y = self.position
+        direction = direction or self.orientation
+        dx, dy = DIR_VECTORS.get(direction, (0, 0))
+        return x + dx, y + dy
 
     def update_from_observation(self, x, y, obs):
-        """Atualiza o conhecimento a partir das observacoes na celula (x, y)."""
+        observation = obs if isinstance(obs, Observation) else Observation.from_tokens(obs)
+        self.update_pose(x, y, self.orientation)
         self.mark_visited(x, y)
 
-        obs = [o.lower() for o in obs]  # servidor varia a grafia das luzes
-        has_breeze = "breeze" in obs
-        has_flash = "flash" in obs
-
-        if has_breeze:
+        if observation.breeze:
             self.breeze_cells.add((x, y))
-        if has_flash:
+        if observation.flash:
             self.flash_cells.add((x, y))
 
-        # Sem brisa => nenhum vizinho tem poco; sem flash => nenhum vizinho
-        # tem teleporte (sensores de 1 passo manhattan, fora diagonais).
         for nx, ny in neighbors(x, y):
-            if not has_breeze:
+            if not observation.breeze:
                 self.no_pit.add((nx, ny))
-            if not has_flash:
+            if not observation.flash:
                 self.no_flash.add((nx, ny))
 
-        # itens na propria celula (e memoria permanente do ponto)
-        kind = None
-        if "bluelight" in obs:
-            kind = "treasure"
-        elif "redlight" in obs:
-            kind = "powerup"
-        elif "weaklight" in obs:
-            kind = "unknown"
-        if kind:
+        if observation.light in ("treasure", "powerup", "unknown"):
+            kind = observation.light
             self.items[(x, y)] = kind
-            # nao rebaixa um ponto ja identificado para "unknown"
             if kind != "unknown" or (x, y) not in self.item_spots:
                 self.item_spots[(x, y)] = kind
 
         self._reinfer()
 
     def _reinfer(self):
-        """Reclassifica celulas desconhecidas com base no conhecimento atual.
-        Aplica resolucao logica: toda brisa exige >= 1 poco vizinho; se sobrar
-        um unico candidato, ele e poco confirmado (idem para flash)."""
+        old_version = self.version
         suspects_pit = set()
-        for (bx, by) in self.breeze_cells:
+        for bx, by in self.breeze_cells:
             cands = [n for n in neighbors(bx, by)
                      if n not in self.no_pit and self.grid[n[0]][n[1]] != BLOCKED]
             if len(cands) == 1:
                 self.confirmed_pits.add(cands[0])
             suspects_pit.update(cands)
+
         suspects_flash = set()
-        for (fx, fy) in self.flash_cells:
+        for fx, fy in self.flash_cells:
             cands = [n for n in neighbors(fx, fy)
                      if n not in self.no_flash and self.grid[n[0]][n[1]] != BLOCKED]
             if len(cands) == 1:
@@ -133,39 +158,54 @@ class WorldModel:
 
         for x in range(WIDTH):
             for y in range(HEIGHT):
-                cell = self.grid[x][y]
-                if cell in (VISITED, BLOCKED):
+                if self.grid[x][y] in (VISITED, BLOCKED):
                     continue
                 p = (x, y) in suspects_pit
                 f = (x, y) in suspects_flash
                 if p and f:
-                    self.grid[x][y] = DANGER_BOTH
+                    new = DANGER_BOTH
                 elif p:
-                    self.grid[x][y] = DANGER_PIT
+                    new = DANGER_PIT
                 elif f:
-                    self.grid[x][y] = DANGER_FLASH
+                    new = DANGER_FLASH
                 elif (x, y) in self.no_pit and (x, y) in self.no_flash:
-                    self.grid[x][y] = SAFE
+                    new = SAFE
                 else:
-                    self.grid[x][y] = UNKNOWN
+                    new = UNKNOWN
+                if self.grid[x][y] != new:
+                    self.grid[x][y] = new
+                    self.version = old_version + 1
 
     def consume_item(self, x, y):
-        self.items.pop((x, y), None)
+        if (x, y) in self.items:
+            self.items.pop((x, y), None)
+            self._changed()
 
     def pit_risk(self, x, y):
-        """Risco relativo de poco: numero de brisas adjacentes 'testemunhando'
-        contra a celula (0 = nenhuma evidencia). Usado quando o agente esta
-        encurralado e precisa escolher o menor risco."""
         if (x, y) in self.no_pit:
             return 0
         if (x, y) in self.confirmed_pits:
             return 99
-        return sum(1 for (bx, by) in self.breeze_cells
-                   if abs(bx - x) + abs(by - y) == 1)
+        return sum(1 for bx, by in self.breeze_cells if abs(bx - x) + abs(by - y) == 1)
 
-    # ---------------- consultas ----------------
+    def teleport_risk(self, x, y):
+        if (x, y) in self.no_flash:
+            return 0
+        if (x, y) in self.confirmed_teleports:
+            return 6
+        return sum(1 for fx, fy in self.flash_cells if abs(fx - x) + abs(fy - y) == 1)
 
-    def is_walkable(self, x, y, allow_unknown=False):
+    def combined_risk(self, x, y):
+        return self.pit_risk(x, y) * 100 + self.teleport_risk(x, y) * 10
+
+    def safe_exit_count(self, x, y):
+        return sum(
+            1 for nx, ny in neighbors(x, y)
+            if self.grid[nx][ny] in (SAFE, VISITED, UNKNOWN, DANGER_FLASH)
+            and self.grid[nx][ny] not in (DANGER_PIT, DANGER_BOTH, BLOCKED)
+        )
+
+    def is_walkable(self, x, y, allow_unknown=False, allow_flash=False):
         if not in_bounds(x, y):
             return False
         cell = self.grid[x][y]
@@ -173,11 +213,21 @@ class WorldModel:
             return True
         if allow_unknown and cell == UNKNOWN:
             return True
+        if allow_flash and cell == DANGER_FLASH:
+            return True
         return False
 
+    def can_enter(self, x, y, allow_unknown=False, allow_flash=False):
+        if not in_bounds(x, y):
+            return False
+        cell = self.grid[x][y]
+        if cell == BLOCKED or cell in (DANGER_PIT, DANGER_BOTH):
+            return False
+        if cell == DANGER_FLASH and not allow_flash:
+            return False
+        return self.is_walkable(x, y, allow_unknown=allow_unknown, allow_flash=allow_flash)
+
     def frontier_cells(self):
-        """Celulas seguras/desconhecidas adjacentes a celulas visitadas:
-        bons alvos de exploracao."""
         frontier = []
         for x in range(WIDTH):
             for y in range(HEIGHT):
@@ -187,59 +237,63 @@ class WorldModel:
                     frontier.append((x, y))
         return frontier
 
-    # ---------------- buscas ----------------
-
-    def nearest_reachable(self, start, goals, allow_flash=False):
-        """BFS multi-alvo: retorna (alvo, caminho) do alvo mais proximo em
-        'goals' alcancavel a partir de start, ou (None, None).
-
-        Diferente de tentar A* alvo a alvo, uma unica varredura garante
-        encontrar QUALQUER alvo alcancavel. A seguranca e a mesma do A*:
-        celulas suspeitas de poco nunca entram; flash so com allow_flash.
-        Celulas desconhecidas sao permitidas no plano porque a execucao
-        valida celula a celula antes de pisar (a observacao da celula
-        atual classifica os vizinhos antes do passo)."""
-        goals = set(goals) - {start}
-        if not goals:
-            return None, None
+    def reachable_map(self, start, allow_flash=False, allow_unknown=True):
+        dist = {start: 0}
         parent = {start: None}
         queue = deque([start])
         while queue:
             cur = queue.popleft()
-            if cur in goals:
-                path = []
-                node = cur
-                while node != start:
-                    path.append(node)
-                    node = parent[node]
-                path.reverse()
-                return cur, path
             for nxt in neighbors(*cur):
-                if nxt in parent:
+                if nxt in dist:
                     continue
-                cell = self.grid[nxt[0]][nxt[1]]
-                if cell == BLOCKED or cell in (DANGER_PIT, DANGER_BOTH):
+                if not self.can_enter(*nxt, allow_unknown=allow_unknown, allow_flash=allow_flash):
                     continue
-                if cell == DANGER_FLASH and not allow_flash:
-                    continue
+                dist[nxt] = dist[cur] + 1
                 parent[nxt] = cur
                 queue.append(nxt)
-        return None, None
+        return dist, parent
 
-    # ---------------- A* ----------------
+    def path_from_parent(self, parent, goal):
+        path = []
+        node = goal
+        while node is not None and parent.get(node) is not None:
+            path.append(node)
+            node = parent[node]
+        path.reverse()
+        return path
+
+    def nearest_reachable(self, start, goals, allow_flash=False):
+        goals = set(goals) - {start}
+        if not goals:
+            return None, None
+        dist, parent = self.reachable_map(start, allow_flash=allow_flash, allow_unknown=True)
+        reachable = [g for g in goals if g in dist]
+        if not reachable:
+            return None, None
+        goal = min(reachable, key=lambda g: dist[g])
+        return goal, self.path_from_parent(parent, goal)
+
+    def farthest_reachable(self, start, goals, score_fn=None, allow_flash=False):
+        goals = set(goals) - {start}
+        if not goals:
+            return None, None
+        dist, parent = self.reachable_map(start, allow_flash=allow_flash, allow_unknown=False)
+        reachable = [g for g in goals if g in dist]
+        if not reachable:
+            return None, None
+        if score_fn is None:
+            def score_fn(cell):
+                return dist[cell]
+        goal = max(reachable, key=score_fn)
+        return goal, self.path_from_parent(parent, goal)
 
     def a_star(self, start, goal, allow_unknown=False, start_dir=None,
-               allow_flash=False):
-        """A* no grid 'ciente de rotacao': cada giro de 90 graus custa 1 acao,
-        entao caminhos retos sao preferidos. O no de busca e (celula, direcao).
-
-        allow_flash: permite atravessar celulas suspeitas APENAS de teleporte
-        (custo alto). Teleporte nao mata (-0 pontos); poco e fatal e nunca
-        e atravessado. Use somente quando nao ha caminho seguro.
-
-        Retorna lista de celulas do caminho (sem o start) ou None."""
+               allow_flash=False, extra_cost=None):
         if start == goal:
             return []
+        if goal != start and not self.can_enter(*goal, allow_unknown=allow_unknown,
+                                                allow_flash=allow_flash):
+            return None
 
         def h(a, b):
             return abs(a[0] - b[0]) + abs(a[1] - b[1])
@@ -265,33 +319,22 @@ class WorldModel:
             if current in closed:
                 continue
             closed.add(current)
-
             for nxt in neighbors(*pos):
-                # o objetivo pode ser uma celula desconhecida (exploracao)
-                walkable = self.is_walkable(*nxt, allow_unknown=allow_unknown) or nxt == goal
-                if not walkable or self.grid[nxt[0]][nxt[1]] == BLOCKED:
+                if not self.can_enter(*nxt, allow_unknown=allow_unknown,
+                                      allow_flash=allow_flash):
                     continue
-                # nunca atravessa celula suspeita de poco (fatal, -1000);
-                # suspeita de teleporte so com allow_flash (ultimo recurso)
                 cell = self.grid[nxt[0]][nxt[1]]
-                if cell in (DANGER_PIT, DANGER_BOTH):
-                    continue
-                if cell == DANGER_FLASH and not allow_flash:
-                    continue
                 ndir = dir_of[(nxt[0] - pos[0], nxt[1] - pos[1])]
-                # celulas desconhecidas custam mais (risco); flash-suspeitas
-                # custam muito mais (teleporte aleatorio atrapalha o plano)
                 if cell in (SAFE, VISITED):
-                    step = 1
+                    step = 1.0
                 elif cell == DANGER_FLASH:
-                    step = 15
+                    step = 15.0
                 else:
-                    step = 3
-                # custo de girar: 90 graus = 1 acao, 180 graus = 2 acoes
-                if cdir is not None and ndir != cdir:
-                    opposite = (DIR_VECTORS[cdir][0] == -DIR_VECTORS[ndir][0] and
-                                DIR_VECTORS[cdir][1] == -DIR_VECTORS[ndir][1])
-                    step += 2 if opposite else 1
+                    step = 3.0
+                step += turn_cost(cdir, ndir)
+                step += min(self.visit_count.get(nxt, 0), 8) * 0.35
+                if extra_cost:
+                    step += extra_cost(nxt)
                 node = (nxt, ndir)
                 ng = g + step
                 if ng < g_cost.get(node, float("inf")):
@@ -299,8 +342,6 @@ class WorldModel:
                     came_from[node] = current
                     heapq.heappush(open_heap, (ng + h(nxt, goal), ng, node))
         return None
-
-    # ---------------- debug ----------------
 
     def render(self, px=None, py=None):
         rows = []
