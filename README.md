@@ -124,7 +124,26 @@ python src/main.py
 
 # host e nome específicos
 python src/main.py atari.icad.puc-rio.br MeuDrone
+
+# partida de mata-mata (perfil de combate mais agressivo, ver abaixo)
+python src/main.py atari.icad.puc-rio.br MeuDrone --aggressive
 ```
+
+## Modo `--aggressive` (partida de mata-mata)
+
+A competição roda 4 partidas com pontuação acumulada; a última é eliminação
+pura (o sobrevivente fica com tudo, e a pontuação só desempata se o tempo
+limite de 10min for atingido sem um vencedor). Como o servidor não informa
+qual partida está em andamento, esse modo precisa ser ligado manualmente na
+linha de comando ao iniciar a partida final.
+
+Ele apenas relaxa os limiares de combate/fuga (`_init_combat_profile` em
+[ai_agent.py](src/ai_agent.py)): caça ativamente com mais frequência (cooldown
+e limiar de agressividade do scan proativo menores), demora mais para
+desistir de um alvo após tiros errados, e só foge com energia realmente
+baixa. A segurança contra poço/teleporte **não muda** — cair num poço ainda
+encerra a partida, então o mapa continua sendo o maior risco, não os outros
+drones.
 
 Não há dependências externas — apenas Python 3 (biblioteca padrão).
 

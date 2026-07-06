@@ -12,6 +12,14 @@ Estados:
 
 A transicao ATTACK/HUNT/FLEE usa a 'agressividade' calculada por um
 controlador fuzzy (fuzzy.py) sobre energia e distancia do inimigo.
+
+Modo 'aggressive' (partida de mata-mata): a competicao roda 4 partidas com
+pontuacao acumulada; a ultima e eliminacao pura (sobrevivente fica com tudo,
+pontuacao so desempata se o tempo limite for atingido sem um vencedor). O
+servidor nao informa qual partida esta em andamento, entao esse modo e
+escolhido manualmente (flag de linha de comando) e so relaxa os limiares de
+combate/fuga -- a seguranca contra poco/teleporte NUNCA muda, pois cair num
+poco ainda encerra a partida.
 """
 
 import time
@@ -41,10 +49,12 @@ TURN_RIGHT_OF = {"north": "east", "east": "south", "south": "west", "west": "nor
 
 
 class DroneAgent:
-    def __init__(self, game_ai, log=print):
+    def __init__(self, game_ai, log=print, aggressive=False):
         self.ai = game_ai
         self.world = WorldModel()
         self.log = log
+        self.aggressive = aggressive
+        self._init_combat_profile(aggressive)
         self.state = "EXPLORE"
         self.path = []            # caminho atual (lista de celulas)
         self.path_allows_flash = False
@@ -89,6 +99,45 @@ class DroneAgent:
         self.last_danger_cell = None
         self.hunt_reason = None      # "damage" (reativo) ou "steps" (proativo)
         self.last_proactive_hunt = 0.0
+
+    def _init_combat_profile(self, aggressive):
+        """Limiares de combate/fuga: perfil 'pontuacao' (padrao, partidas 1-3,
+        farm e prioridade) vs 'mata-mata' (partida final, sobreviver e
+        eliminar e o unico objetivo -- farm so preenche tempo ocioso).
+
+        No mata-mata o mapa costuma forcar encontro (arena fechada) e as
+        partidas observadas terminam bem antes do limite de 10min, entao
+        ficar na defensiva so adia o confronto sem evita-lo: o perfil
+        agressivo caca ativamente com mais frequencia, demora mais para
+        desistir de um alvo e so foge com energia realmente baixa."""
+        if aggressive:
+            self.proactive_hunt_cooldown = 5.0
+            self.proactive_hunt_aggr_min = 0.35
+            self.max_attack_dist = 9
+            self.flee_aggr_min = 0.15         # so foge com inimigo a vista se muito fraco
+            self.steps_flee_aggr_min = 0.12    # so foge de passos ouvidos se quase sem chance
+            self.damage_hunt_aggr_min = 0.30   # ao levar tiro, cacar em vez de fugir
+            self.shots_since_hit_range_cutoff = 6   # tolera mais erros a distancia
+            self.shots_since_hit_disengage = 8      # so desengaja apos muito mais erros
+            self.disengage_pause_seconds = 3.0      # pausa curta: sem custo de oportunidade
+            self.min_shots_hitrate_check = 12
+            self.min_hit_rate_cutoff = 0.08
+            self.hunt_turns_steps = 4
+            self.hunt_turns_damage = 6
+        else:
+            self.proactive_hunt_cooldown = PROACTIVE_HUNT_COOLDOWN
+            self.proactive_hunt_aggr_min = 0.65
+            self.max_attack_dist = MAX_ATTACK_DIST
+            self.flee_aggr_min = 0.30
+            self.steps_flee_aggr_min = 0.25
+            self.damage_hunt_aggr_min = 0.5
+            self.shots_since_hit_range_cutoff = 3
+            self.shots_since_hit_disengage = 4
+            self.disengage_pause_seconds = 8.0
+            self.min_shots_hitrate_check = 6
+            self.min_hit_rate_cutoff = 0.20
+            self.hunt_turns_steps = 2
+            self.hunt_turns_damage = 4
 
     # ---------------- percepcao ----------------
 
@@ -204,23 +253,23 @@ class DroneAgent:
                 pass
             elif self._should_attack(enemy_dist, energy):
                 return "ATTACK"
-            elif enemy_dist <= 3 or self.aggr < 0.30:
+            elif enemy_dist <= 3 or self.aggr < self.flee_aggr_min:
                 return "FLEE"
             else:
                 return "EXPLORE"
         if took_damage:
             # levamos tiro: o atirador esta em linha reta conosco
-            if self.aggr >= 0.5:
+            if self.aggr >= self.damage_hunt_aggr_min:
                 self.hunt_reason = "damage"
                 return "HUNT"
             return "FLEE"
-        if hears_steps and self.aggr < 0.25:
+        if hears_steps and self.aggr < self.steps_flee_aggr_min:
             return "FLEE"
         # passos ouvidos de novo enquanto ja estavamos em janela de ameaca
         # (persistente, nao um blip isolado) e energia favorece confronto:
         # gira em busca do inimigo em vez de so continuar explorando as cegas.
-        if (hears_steps and had_prior_threat and self.aggr >= 0.65
-                and now - self.last_proactive_hunt >= PROACTIVE_HUNT_COOLDOWN):
+        if (hears_steps and had_prior_threat and self.aggr >= self.proactive_hunt_aggr_min
+                and now - self.last_proactive_hunt >= self.proactive_hunt_cooldown):
             self.last_proactive_hunt = now
             self.hunt_reason = "steps"
             return "HUNT"
@@ -229,18 +278,20 @@ class DroneAgent:
         return "EXPLORE"
 
     def _should_attack(self, enemy_dist, energy):
-        """Tiro custa caro; so insistimos quando a chance/beneficio compensa."""
+        """Tiro custa caro; so insistimos quando a chance/beneficio compensa
+        (limiares variam pelo perfil de combate: ver _init_combat_profile)."""
         if time.time() < self.engage_pause_until:
             return False
-        if enemy_dist > MAX_ATTACK_DIST and energy < 85:
+        if enemy_dist > self.max_attack_dist and energy < 85:
             return False
         if energy < 35 and enemy_dist > 2:
             return False
 
         hit_rate = self.shots_hit / self.shots_fired if self.shots_fired else 0.5
-        if self.shots_fired >= 6 and hit_rate < 0.20 and enemy_dist > 3:
+        if (self.shots_fired >= self.min_shots_hitrate_check
+                and hit_rate < self.min_hit_rate_cutoff and enemy_dist > 3):
             return False
-        if self.shots_since_hit >= 3 and enemy_dist > 4:
+        if self.shots_since_hit >= self.shots_since_hit_range_cutoff and enemy_dist > 4:
             return False
         return self.aggr >= 0.42 or (energy >= 80 and enemy_dist <= 7)
 
@@ -436,11 +487,12 @@ class DroneAgent:
                      if o.startswith(("enemy", "eneny")) and "#" in o), "?")
         self.log(f"[ACAO] ATIRAR! Inimigo a frente (dist={dist}) energia={energy} "
                  f"tiros_sem_acerto={self.shots_since_hit}")
-        if self.shots_since_hit >= 4:
-            self.engage_pause_until = time.time() + 8
+        if self.shots_since_hit >= self.shots_since_hit_disengage:
+            self.engage_pause_until = time.time() + self.disengage_pause_seconds
             self.shots_since_hit = 0
             self.state = "EXPLORE"
-            self.log("[FSM] Muitos tiros sem acerto: desengajando por 8s")
+            self.log(f"[FSM] Muitos tiros sem acerto: desengajando por "
+                     f"{self.disengage_pause_seconds:.0f}s")
 
     def do_hunt(self, x, y, d, energy, obs):
         # gira procurando o inimigo. Scan reativo (levou tiro, atirador
@@ -448,7 +500,8 @@ class DroneAgent:
         # passos persistentes, inimigo pode nem estar perto) gira so 2x
         # para nao desperdicar acoes atras de um alvo incerto.
         if self.hunt_turns <= 0:
-            self.hunt_turns = 2 if self.hunt_reason == "steps" else 4
+            self.hunt_turns = (self.hunt_turns_steps if self.hunt_reason == "steps"
+                              else self.hunt_turns_damage)
         self.ai.send_turn_right()
         self.last_action = "turn"
         self.last_target = None

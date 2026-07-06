@@ -3,14 +3,21 @@ INF1771 - Trabalho Final: Desafio dos Drones
 Ponto de entrada do agente.
 
 Uso:
-    python main.py [host] [nome]
+    python main.py [host] [nome] [--aggressive]
 
 Padrao: host = atari.icad.puc-rio.br (servidor de treino), nome = DroneIA.
+
+--aggressive ativa o perfil de combate da partida de mata-mata (ultima das
+4 partidas): caca ativamente com mais frequencia, demora mais para desistir
+de um alvo e so foge com energia realmente baixa. O servidor nao informa
+qual partida esta rodando, entao essa flag precisa ser passada manualmente
+ao iniciar a partida final.
 """
 
 import sys
 import time
 import random
+import threading
 
 from devkit import GameAI
 from ai_agent import DroneAgent
@@ -26,6 +33,7 @@ VISIBLE_PREFIXES = (
     "[STATUS]",
     "[FARM]",
     "[REDE]",
+    "[CHAT]",
 )
 
 
@@ -50,19 +58,39 @@ def log_summary(ai, agent):
     )
 
 
+def chat_input_loop(ai):
+    """Le linha a linha do stdin numa thread separada e manda como chat do
+    jogo. input() bloqueia so esta thread; o loop principal do agente (que
+    roda em outra thread) continua agindo normalmente enquanto isso."""
+    while ai.connected:
+        try:
+            line = input()
+        except EOFError:
+            break
+        line = line.strip()
+        if line:
+            ai.send_say(line)
+            log(f"[CHAT] Enviado: {line}")
+
+
 def main():
-    host = sys.argv[1] if len(sys.argv) > 1 else "atari.icad.puc-rio.br"
-    name = sys.argv[2] if len(sys.argv) > 2 else f"DroneIA_{random.randint(100, 999)}"
+    aggressive = "--aggressive" in sys.argv
+    positional = [a for a in sys.argv[1:] if not a.startswith("--")]
+    host = positional[0] if len(positional) > 0 else "atari.icad.puc-rio.br"
+    name = positional[1] if len(positional) > 1 else f"DroneIA_{random.randint(100, 999)}"
 
     ai = GameAI()
-    log(f"[INIT] Conectando em {host}:8888 como '{name}'...")
+    log(f"[INIT] Conectando em {host}:8888 como '{name}'"
+        f"{' [modo agressivo]' if aggressive else ''}...")
     if not ai.connect(host, name):
         log("[INIT] Nao foi possivel conectar. Verifique o servidor.")
         sys.exit(1)
 
-    ai.send_color(0, 200, 255)
-    agent = DroneAgent(ai, log=log)
-    log("[INIT] Conectado. Aguardando inicio da partida...")
+    ai.send_color(255, 255, 0)
+    agent = DroneAgent(ai, log=log, aggressive=aggressive)
+    threading.Thread(target=chat_input_loop, args=(ai,), daemon=True).start()
+    log("[INIT] Conectado. Aguardando inicio da partida... "
+        "(digite uma mensagem e Enter a qualquer momento para falar no chat)")
 
     last_game_check = 0.0
     last_summary = 0.0
@@ -80,7 +108,7 @@ def main():
 
             # nova partida: zera o modelo de mundo (mapa/itens podem mudar)
             if in_game and not was_in_game:
-                agent = DroneAgent(ai, log=log)
+                agent = DroneAgent(ai, log=log, aggressive=aggressive)
                 log("[JOGO] Partida iniciada: novo modelo de mundo")
                 last_summary = 0.0
             was_in_game = in_game
